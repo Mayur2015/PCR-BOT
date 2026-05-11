@@ -51,7 +51,17 @@ last_heartbeat_hour = -1
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.get(url, params={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": msg
+        }
+
+        response = requests.post(url, data=payload, timeout=10)
+
+        print("TELEGRAM STATUS:", response.status_code)
+        print("TELEGRAM RESPONSE:", response.text)
+
     except Exception as e:
         print("Telegram Error:", e)
 
