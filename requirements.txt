@@ -1,4 +1,4 @@
 requests
 pytz
 pyotp
-SmartApi
+smartapi-python
