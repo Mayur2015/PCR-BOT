@@ -2,4 +2,3 @@ requests
 pytz
 pyotp
 SmartApi
-csv
