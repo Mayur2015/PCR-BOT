@@ -26,18 +26,35 @@ open_trade = None
 
 PAPER_FILE = "paper_trades.csv"
 
-# ============================
-# STRATEGY SETTINGS
-# ============================
-SLEEP_SECONDS = 180
+# BUY CE LOGIC
+if (
+    pcr_change >= MIN_PCR_CHANGE
+    and atm_pcr >= ATM_PCR_CALL_BUY
+    and call_price is not None
+):
+    open_trade = {
+        "entry_time": time_str,
+        "trade_type": "BUY CE",
+        "symbol": atm_ce_symbol,
+        "token": atm_ce_token,
+        "entry_price": round(call_price, 2),
+        "nifty_entry": round(nifty, 2),
+        "pcr_entry": round(pcr, 4),
+        "atm_pcr_entry": round(atm_pcr, 4),
+        "max_pain_entry": max_pain
+    }
 
-STOPLOSS_POINTS = 20
-TARGET_POINTS = 40
-
-ATM_PCR_CALL_BUY = 1.20
-ATM_PCR_PUT_BUY = 0.80
-
-MIN_PCR_CHANGE = 0.03
+    send_telegram(
+        f"🟢 PAPER BUY CE ALERT\n"
+        f"Symbol: {atm_ce_symbol}\n"
+        f"Entry Price: {round(call_price, 2)}\n"
+        f"NIFTY: {round(nifty, 2)}\n"
+        f"PCR: {round(pcr, 4)}\n"
+        f"ATM PCR: {round(atm_pcr, 4)}\n"
+        f"Max Pain: {max_pain}\n"
+        f"Reason: TEST MODE FAST ENTRY\n"
+        f"Time: {time_str}"
+    )
 
 
 # ============================
@@ -530,35 +547,34 @@ while True:
                     )
 
                 # BUY PE LOGIC
-                elif (
-                    pcr_change <= -MIN_PCR_CHANGE
-                    and atm_pcr <= ATM_PCR_PUT_BUY
-                    and nifty <= max_pain
-                    and put_price is not None
-                ):
-                    open_trade = {
-                        "entry_time": time_str,
-                        "trade_type": "BUY PE",
-                        "symbol": atm_pe_symbol,
-                        "token": atm_pe_token,
-                        "entry_price": round(put_price, 2),
-                        "nifty_entry": round(nifty, 2),
-                        "pcr_entry": round(pcr, 4),
-                        "atm_pcr_entry": round(atm_pcr, 4),
-                        "max_pain_entry": max_pain
-                    }
+elif (
+    pcr_change <= -MIN_PCR_CHANGE
+    and atm_pcr <= ATM_PCR_PUT_BUY
+    and put_price is not None
+):
+    open_trade = {
+        "entry_time": time_str,
+        "trade_type": "BUY PE",
+        "symbol": atm_pe_symbol,
+        "token": atm_pe_token,
+        "entry_price": round(put_price, 2),
+        "nifty_entry": round(nifty, 2),
+        "pcr_entry": round(pcr, 4),
+        "atm_pcr_entry": round(atm_pcr, 4),
+        "max_pain_entry": max_pain
+    }
 
-                    send_telegram(
-                        f"🔴 PAPER BUY PE ALERT\n"
-                        f"Symbol: {atm_pe_symbol}\n"
-                        f"Entry Price: {round(put_price, 2)}\n"
-                        f"NIFTY: {round(nifty, 2)}\n"
-                        f"PCR: {round(pcr, 4)}\n"
-                        f"ATM PCR: {round(atm_pcr, 4)}\n"
-                        f"Max Pain: {max_pain}\n"
-                        f"Reason: PCR DOWN + ATM PCR WEAK + NIFTY BELOW MAX PAIN\n"
-                        f"Time: {time_str}"
-                    )
+    send_telegram(
+        f"🔴 PAPER BUY PE ALERT\n"
+        f"Symbol: {atm_pe_symbol}\n"
+        f"Entry Price: {round(put_price, 2)}\n"
+        f"NIFTY: {round(nifty, 2)}\n"
+        f"PCR: {round(pcr, 4)}\n"
+        f"ATM PCR: {round(atm_pcr, 4)}\n"
+        f"Max Pain: {max_pain}\n"
+        f"Reason: TEST MODE FAST ENTRY\n"
+        f"Time: {time_str}"
+    )
 
         # ============================
         # FORCE EXIT AFTER MARKET
