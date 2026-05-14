@@ -93,12 +93,13 @@ def init_google_sheet():
     global google_sheet
 
     try:
-        if not GOOGLE_SHEET_NAME or not GOOGLE_CREDENTIALS:
+        if not GOOGLE_SHEET_NAME or not GOOGLE_CREDENTIALS_BASE64:
             print("Google Sheet variables missing")
             send_telegram("⚠️ GOOGLE SHEET VARIABLES MISSING")
             return False
 
-        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        creds_json = base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode("utf-8")
+        creds_dict = json.loads(creds_json)
 
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
