@@ -2,8 +2,11 @@ import requests
 import time
 import csv
 import os
+import json
 from datetime import datetime
 import pytz
+import gspread
+from google.oauth2.service_account import Credentials
 from SmartApi import SmartConnect
 import pyotp
 
@@ -25,6 +28,10 @@ prev_atm_pcr = None
 open_trade = None
 
 PAPER_FILE = "paper_trades.csv"
+
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+google_sheet = None
 
 # ============================
 # FAST TEST STRATEGY SETTINGS
@@ -79,6 +86,44 @@ def log_error(error_msg):
 
 
 # ============================
+# GOOGLE SHEET INIT
+# ============================
+def init_google_sheet():
+    global google_sheet
+
+    try:
+        if not GOOGLE_SHEET_NAME or not GOOGLE_CREDENTIALS:
+            print("Google Sheet variables missing")
+            send_telegram("⚠️ GOOGLE SHEET VARIABLES MISSING")
+            return False
+
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=scopes
+        )
+
+        client = gspread.authorize(creds)
+        google_sheet = client.open(GOOGLE_SHEET_NAME).sheet1
+
+        print("GOOGLE SHEET CONNECTED")
+        send_telegram("✅ GOOGLE SHEET CONNECTED SUCCESSFULLY")
+        return True
+
+    except Exception as e:
+        print("Google Sheet Init Error:", e)
+        send_telegram(f"❌ GOOGLE SHEET INIT ERROR\n{e}")
+        log_error(str(e))
+        return False
+
+
+# ============================
 # PAPER TRADE FILE INIT
 # ============================
 def init_paper_file():
@@ -108,7 +153,7 @@ def init_paper_file():
 
 
 # ============================
-# SAVE PAPER TRADE
+# SAVE PAPER TRADE CSV
 # ============================
 def save_paper_trade(trade, exit_time, exit_price, reason, nifty_exit, pcr_exit, atm_pcr_exit, max_pain_exit):
     try:
@@ -141,6 +186,49 @@ def save_paper_trade(trade, exit_time, exit_price, reason, nifty_exit, pcr_exit,
 
     except Exception as e:
         print("Paper Trade Save Error:", e)
+        log_error(str(e))
+
+
+# ============================
+# SAVE GOOGLE SHEET TRADE
+# ============================
+def save_google_trade(trade, exit_time, exit_price, reason, nifty_exit, pcr_exit, atm_pcr_exit, max_pain_exit):
+    try:
+        if google_sheet is None:
+            print("Google Sheet not connected")
+            return
+
+        points = round(exit_price - trade["entry_price"], 2)
+
+        result = "PROFIT" if points > 0 else "LOSS" if points < 0 else "NO PROFIT NO LOSS"
+
+        row = [
+            trade["entry_time"],
+            exit_time,
+            trade["trade_type"],
+            trade["symbol"],
+            trade["token"],
+            trade["entry_price"],
+            exit_price,
+            points,
+            result,
+            reason,
+            trade["nifty_entry"],
+            nifty_exit,
+            trade["pcr_entry"],
+            pcr_exit,
+            trade["atm_pcr_entry"],
+            atm_pcr_exit,
+            trade["max_pain_entry"],
+            max_pain_exit
+        ]
+
+        google_sheet.append_row(row, value_input_option="USER_ENTERED")
+        print("Trade saved to Google Sheet")
+
+    except Exception as e:
+        print("Google Sheet Save Error:", e)
+        send_telegram(f"❌ GOOGLE SHEET SAVE ERROR\n{e}")
         log_error(str(e))
 
 
@@ -219,9 +307,11 @@ def safe_ltp(exchange, symbol, token, retry=3):
 # START BOT
 # ============================
 init_paper_file()
+init_google_sheet()
 
 if not login():
     exit()
+
 
 # ============================
 # SYMBOL MASTER
@@ -487,6 +577,17 @@ while True:
                             max_pain
                         )
 
+                        save_google_trade(
+                            open_trade,
+                            time_str,
+                            round(current_price, 2),
+                            exit_reason,
+                            round(nifty, 2),
+                            round(pcr, 4),
+                            round(atm_pcr, 4),
+                            max_pain
+                        )
+
                         send_telegram(
                             f"🚪 PAPER TRADE EXIT\n"
                             f"Type: {open_trade['trade_type']}\n"
@@ -580,6 +681,17 @@ while True:
                 points = round(exit_price - open_trade["entry_price"], 2)
 
                 save_paper_trade(
+                    open_trade,
+                    time_str,
+                    round(exit_price, 2),
+                    "MARKET CLOSED EXIT",
+                    round(nifty, 2),
+                    round(pcr, 4),
+                    round(atm_pcr, 4),
+                    max_pain
+                )
+
+                save_google_trade(
                     open_trade,
                     time_str,
                     round(exit_price, 2),
