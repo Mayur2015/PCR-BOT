@@ -8,7 +8,7 @@ from SmartApi import SmartConnect
 import pyotp
 
 # ============================
-# TELEGRAM CONFIG FROM RAILWAY VARIABLES
+# TELEGRAM CONFIG
 # ============================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -26,35 +26,18 @@ open_trade = None
 
 PAPER_FILE = "paper_trades.csv"
 
-# BUY CE LOGIC
-if (
-    pcr_change >= MIN_PCR_CHANGE
-    and atm_pcr >= ATM_PCR_CALL_BUY
-    and call_price is not None
-):
-    open_trade = {
-        "entry_time": time_str,
-        "trade_type": "BUY CE",
-        "symbol": atm_ce_symbol,
-        "token": atm_ce_token,
-        "entry_price": round(call_price, 2),
-        "nifty_entry": round(nifty, 2),
-        "pcr_entry": round(pcr, 4),
-        "atm_pcr_entry": round(atm_pcr, 4),
-        "max_pain_entry": max_pain
-    }
+# ============================
+# FAST TEST STRATEGY SETTINGS
+# ============================
+SLEEP_SECONDS = 60
 
-    send_telegram(
-        f"🟢 PAPER BUY CE ALERT\n"
-        f"Symbol: {atm_ce_symbol}\n"
-        f"Entry Price: {round(call_price, 2)}\n"
-        f"NIFTY: {round(nifty, 2)}\n"
-        f"PCR: {round(pcr, 4)}\n"
-        f"ATM PCR: {round(atm_pcr, 4)}\n"
-        f"Max Pain: {max_pain}\n"
-        f"Reason: TEST MODE FAST ENTRY\n"
-        f"Time: {time_str}"
-    )
+STOPLOSS_POINTS = 5
+TARGET_POINTS = 8
+
+ATM_PCR_CALL_BUY = 1.02
+ATM_PCR_PUT_BUY = 0.98
+
+MIN_PCR_CHANGE = 0.005
 
 
 # ============================
@@ -125,14 +108,11 @@ def init_paper_file():
 
 
 # ============================
-# SAVE CLOSED PAPER TRADE
+# SAVE PAPER TRADE
 # ============================
 def save_paper_trade(trade, exit_time, exit_price, reason, nifty_exit, pcr_exit, atm_pcr_exit, max_pain_exit):
     try:
         points = round(exit_price - trade["entry_price"], 2)
-
-        if trade["trade_type"] == "BUY PE":
-            points = round(exit_price - trade["entry_price"], 2)
 
         result = "PROFIT" if points > 0 else "LOSS" if points < 0 else "NO PROFIT NO LOSS"
 
@@ -178,7 +158,10 @@ def login():
 
         if not api_key or not client_id or not password or not totp_key:
             print("Railway environment variables missing")
-            send_telegram("❌ RAILWAY VARIABLES MISSING\nCheck API_KEY, CLIENT_ID, PASSWORD, TOTP_KEY, TOKEN, CHAT_ID")
+            send_telegram(
+                "❌ RAILWAY VARIABLES MISSING\n"
+                "Check API_KEY, CLIENT_ID, PASSWORD, TOTP_KEY, TOKEN, CHAT_ID"
+            )
             return False
 
         smartApi = SmartConnect(api_key)
@@ -233,7 +216,7 @@ def safe_ltp(exchange, symbol, token, retry=3):
 
 
 # ============================
-# START
+# START BOT
 # ============================
 init_paper_file()
 
@@ -243,13 +226,19 @@ if not login():
 # ============================
 # SYMBOL MASTER
 # ============================
-url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+try:
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-symbols = requests.get(
-    url,
-    headers={"Cache-Control": "no-cache"},
-    timeout=20
-).json()
+    symbols = requests.get(
+        url,
+        headers={"Cache-Control": "no-cache"},
+        timeout=20
+    ).json()
+
+except Exception as e:
+    print("SYMBOL MASTER ERROR:", e)
+    send_telegram(f"❌ SYMBOL MASTER ERROR\n{e}")
+    exit()
 
 
 # ============================
@@ -264,7 +253,6 @@ while True:
 
         # ============================
         # FIXED HEARTBEAT
-        # Sends once every even hour, no second-based miss issue
         # ============================
         if now.hour % 2 == 0 and last_heartbeat_hour != now.hour:
             send_telegram(f"✅ BOT RUNNING HEALTHY\nTime: {time_str}")
@@ -368,7 +356,7 @@ while True:
         for i in range(0, len(tokens), 50):
             data = smartApi.getMarketData(
                 "FULL",
-                {"NFO": tokens[i:i+50]}
+                {"NFO": tokens[i:i + 50]}
             )
 
             if data and data.get("status"):
@@ -421,10 +409,15 @@ while True:
         # ============================
         # MAX PAIN
         # ============================
+        if not strike_data:
+            print("NO STRIKE DATA")
+            time.sleep(SLEEP_SECONDS)
+            continue
+
         max_pain = min(
             strike_data,
             key=lambda x: sum(
-                (x-k) * v["ce"] if x > k else (k-x) * v["pe"]
+                (x - k) * v["ce"] if x > k else (k - x) * v["pe"]
                 for k, v in strike_data.items()
             )
         )
@@ -441,7 +434,7 @@ while True:
         print("Max Pain:", max_pain)
 
         # ============================
-        # PAPER TRADING LOGIC ONLY IN LIVE MARKET
+        # PAPER TRADING ONLY LIVE MARKET
         # ============================
         if mode == "LIVE MARKET":
 
@@ -466,7 +459,7 @@ while True:
 
                 if current_price is not None:
 
-                    points = current_price - open_trade["entry_price"]
+                    points = round(current_price - open_trade["entry_price"], 2)
 
                     exit_reason = None
 
@@ -500,7 +493,7 @@ while True:
                             f"Symbol: {open_trade['symbol']}\n"
                             f"Entry: {open_trade['entry_price']}\n"
                             f"Exit: {round(current_price, 2)}\n"
-                            f"Points: {round(points, 2)}\n"
+                            f"Points: {points}\n"
                             f"Reason: {exit_reason}\n"
                             f"Time: {time_str}"
                         )
@@ -508,20 +501,19 @@ while True:
                         open_trade = None
 
             # ============================
-            # ENTRY LOGIC
+            # ENTRY LOGIC - FAST TEST MODE
             # ============================
             if open_trade is None and prev_pcr is not None and prev_atm_pcr is not None:
 
                 pcr_change = pcr - prev_pcr
-                atm_pcr_change = atm_pcr - prev_atm_pcr
 
                 # BUY CE LOGIC
                 if (
                     pcr_change >= MIN_PCR_CHANGE
                     and atm_pcr >= ATM_PCR_CALL_BUY
-                    and nifty >= max_pain
                     and call_price is not None
                 ):
+
                     open_trade = {
                         "entry_time": time_str,
                         "trade_type": "BUY CE",
@@ -542,51 +534,51 @@ while True:
                         f"PCR: {round(pcr, 4)}\n"
                         f"ATM PCR: {round(atm_pcr, 4)}\n"
                         f"Max Pain: {max_pain}\n"
-                        f"Reason: PCR UP + ATM PCR STRONG + NIFTY ABOVE MAX PAIN\n"
+                        f"Reason: TEST MODE FAST ENTRY\n"
                         f"Time: {time_str}"
                     )
 
                 # BUY PE LOGIC
-elif (
-    pcr_change <= -MIN_PCR_CHANGE
-    and atm_pcr <= ATM_PCR_PUT_BUY
-    and put_price is not None
-):
-    open_trade = {
-        "entry_time": time_str,
-        "trade_type": "BUY PE",
-        "symbol": atm_pe_symbol,
-        "token": atm_pe_token,
-        "entry_price": round(put_price, 2),
-        "nifty_entry": round(nifty, 2),
-        "pcr_entry": round(pcr, 4),
-        "atm_pcr_entry": round(atm_pcr, 4),
-        "max_pain_entry": max_pain
-    }
+                elif (
+                    pcr_change <= -MIN_PCR_CHANGE
+                    and atm_pcr <= ATM_PCR_PUT_BUY
+                    and put_price is not None
+                ):
 
-    send_telegram(
-        f"🔴 PAPER BUY PE ALERT\n"
-        f"Symbol: {atm_pe_symbol}\n"
-        f"Entry Price: {round(put_price, 2)}\n"
-        f"NIFTY: {round(nifty, 2)}\n"
-        f"PCR: {round(pcr, 4)}\n"
-        f"ATM PCR: {round(atm_pcr, 4)}\n"
-        f"Max Pain: {max_pain}\n"
-        f"Reason: TEST MODE FAST ENTRY\n"
-        f"Time: {time_str}"
-    )
+                    open_trade = {
+                        "entry_time": time_str,
+                        "trade_type": "BUY PE",
+                        "symbol": atm_pe_symbol,
+                        "token": atm_pe_token,
+                        "entry_price": round(put_price, 2),
+                        "nifty_entry": round(nifty, 2),
+                        "pcr_entry": round(pcr, 4),
+                        "atm_pcr_entry": round(atm_pcr, 4),
+                        "max_pain_entry": max_pain
+                    }
+
+                    send_telegram(
+                        f"🔴 PAPER BUY PE ALERT\n"
+                        f"Symbol: {atm_pe_symbol}\n"
+                        f"Entry Price: {round(put_price, 2)}\n"
+                        f"NIFTY: {round(nifty, 2)}\n"
+                        f"PCR: {round(pcr, 4)}\n"
+                        f"ATM PCR: {round(atm_pcr, 4)}\n"
+                        f"Max Pain: {max_pain}\n"
+                        f"Reason: TEST MODE FAST ENTRY\n"
+                        f"Time: {time_str}"
+                    )
 
         # ============================
         # FORCE EXIT AFTER MARKET
         # ============================
         elif mode == "AFTER MARKET" and open_trade is not None:
 
-            if open_trade["trade_type"] == "BUY CE":
-                exit_price = safe_ltp("NFO", open_trade["symbol"], open_trade["token"])
-            else:
-                exit_price = safe_ltp("NFO", open_trade["symbol"], open_trade["token"])
+            exit_price = safe_ltp("NFO", open_trade["symbol"], open_trade["token"])
 
             if exit_price is not None:
+                points = round(exit_price - open_trade["entry_price"], 2)
+
                 save_paper_trade(
                     open_trade,
                     time_str,
@@ -604,6 +596,7 @@ elif (
                     f"Symbol: {open_trade['symbol']}\n"
                     f"Entry: {open_trade['entry_price']}\n"
                     f"Exit: {round(exit_price, 2)}\n"
+                    f"Points: {points}\n"
                     f"Reason: MARKET CLOSED EXIT\n"
                     f"Time: {time_str}"
                 )
