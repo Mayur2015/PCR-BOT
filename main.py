@@ -30,7 +30,7 @@ open_trade = None
 
 PAPER_FILE = "paper_trades.csv"
 
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_BASE64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
 google_sheet = None
 
