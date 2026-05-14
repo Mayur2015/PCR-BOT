@@ -93,7 +93,7 @@ def init_google_sheet():
     global google_sheet
 
     try:
-        if not GOOGLE_SHEET_NAME or not GOOGLE_CREDENTIALS_BASE64:
+        if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_BASE64:
             print("Google Sheet variables missing")
             send_telegram("⚠️ GOOGLE SHEET VARIABLES MISSING")
             return False
@@ -112,7 +112,7 @@ def init_google_sheet():
         )
 
         client = gspread.authorize(creds)
-        google_sheet = client.open(GOOGLE_SHEET_NAME).sheet1
+        google_sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
         print("GOOGLE SHEET CONNECTED")
         send_telegram("✅ GOOGLE SHEET CONNECTED SUCCESSFULLY")
