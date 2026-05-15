@@ -23,9 +23,6 @@ CHAT_ID = os.getenv("CHAT_ID")
 smartApi = None
 last_heartbeat_hour = -1
 
-prev_pcr = None
-prev_atm_pcr = None
-
 open_trade = None
 
 PAPER_FILE = "paper_trades.csv"
@@ -35,17 +32,38 @@ GOOGLE_CREDENTIALS_BASE64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
 google_sheet = None
 
 # ============================
-# FAST TEST STRATEGY SETTINGS
+# STRATEGY SETTINGS
 # ============================
 SLEEP_SECONDS = 60
+
+PCR_SAMPLE_SECONDS = 180
+
+ENTRY_ATM_PCR_CHANGE = 0.30
+ENTRY_PCR_CHANGE = 0.07
+
+EXIT_PCR_STRONG_REVERSAL = 0.05
 
 STOPLOSS_POINTS = 5
 TARGET_POINTS = 8
 
-ATM_PCR_CALL_BUY = 1.02
-ATM_PCR_PUT_BUY = 0.98
+last_pcr_sample_time = None
+sample_pcr = None
+sample_atm_pcr = None
 
-MIN_PCR_CHANGE = 0.005
+ce_pcr_decrease_count = 0
+pe_pcr_increase_count = 0
+
+# ============================
+# CSV HEADERS
+# ============================
+HEADERS = [
+    "Entry Time", "Exit Time", "Trade Type", "Symbol", "Token",
+    "Entry Price", "Exit Price", "Points", "Result", "Exit Reason",
+    "NIFTY Entry", "NIFTY Exit", "PCR Entry", "PCR Exit",
+    "ATM PCR Entry", "ATM PCR Exit", "Max Pain Entry", "Max Pain Exit",
+    "PCR Change Entry", "ATM PCR Change Entry", "Entry Trigger",
+    "Exit Trigger", "Trade Duration Min"
+]
 
 
 # ============================
@@ -58,12 +76,7 @@ def send_telegram(msg):
             return
 
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": msg
-        }
-
+        payload = {"chat_id": CHAT_ID, "text": msg}
         response = requests.post(url, data=payload, timeout=10)
 
         print("TELEGRAM STATUS:", response.status_code)
@@ -106,11 +119,7 @@ def init_google_sheet():
             "https://www.googleapis.com/auth/drive"
         ]
 
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=scopes
-        )
-
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
         google_sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
@@ -132,77 +141,32 @@ def init_paper_file():
     if not os.path.exists(PAPER_FILE):
         with open(PAPER_FILE, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "Entry Time",
-                "Exit Time",
-                "Trade Type",
-                "Symbol",
-                "Token",
-                "Entry Price",
-                "Exit Price",
-                "Points",
-                "Result",
-                "Reason",
-                "NIFTY Entry",
-                "NIFTY Exit",
-                "PCR Entry",
-                "PCR Exit",
-                "ATM PCR Entry",
-                "ATM PCR Exit",
-                "Max Pain Entry",
-                "Max Pain Exit"
-            ])
+            writer.writerow(HEADERS)
+
+
+# ============================
+# TRADE DURATION
+# ============================
+def get_trade_duration_minutes(entry_time, exit_time):
+    try:
+        e1 = datetime.strptime(entry_time, "%Y-%m-%d %H:%M:%S")
+        e2 = datetime.strptime(exit_time, "%Y-%m-%d %H:%M:%S")
+        return round((e2 - e1).total_seconds() / 60, 2)
+    except:
+        return ""
 
 
 # ============================
 # SAVE PAPER TRADE CSV
 # ============================
-def save_paper_trade(trade, exit_time, exit_price, reason, nifty_exit, pcr_exit, atm_pcr_exit, max_pain_exit):
+def save_paper_trade(
+    trade, exit_time, exit_price, exit_reason, exit_trigger,
+    nifty_exit, pcr_exit, atm_pcr_exit, max_pain_exit
+):
     try:
         points = round(exit_price - trade["entry_price"], 2)
-
         result = "PROFIT" if points > 0 else "LOSS" if points < 0 else "NO PROFIT NO LOSS"
-
-        with open(PAPER_FILE, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                trade["entry_time"],
-                exit_time,
-                trade["trade_type"],
-                trade["symbol"],
-                trade["token"],
-                trade["entry_price"],
-                exit_price,
-                points,
-                result,
-                reason,
-                trade["nifty_entry"],
-                nifty_exit,
-                trade["pcr_entry"],
-                pcr_exit,
-                trade["atm_pcr_entry"],
-                atm_pcr_exit,
-                trade["max_pain_entry"],
-                max_pain_exit
-            ])
-
-    except Exception as e:
-        print("Paper Trade Save Error:", e)
-        log_error(str(e))
-
-
-# ============================
-# SAVE GOOGLE SHEET TRADE
-# ============================
-def save_google_trade(trade, exit_time, exit_price, reason, nifty_exit, pcr_exit, atm_pcr_exit, max_pain_exit):
-    try:
-        if google_sheet is None:
-            print("Google Sheet not connected")
-            return
-
-        points = round(exit_price - trade["entry_price"], 2)
-
-        result = "PROFIT" if points > 0 else "LOSS" if points < 0 else "NO PROFIT NO LOSS"
+        duration = get_trade_duration_minutes(trade["entry_time"], exit_time)
 
         row = [
             trade["entry_time"],
@@ -214,7 +178,7 @@ def save_google_trade(trade, exit_time, exit_price, reason, nifty_exit, pcr_exit
             exit_price,
             points,
             result,
-            reason,
+            exit_reason,
             trade["nifty_entry"],
             nifty_exit,
             trade["pcr_entry"],
@@ -222,7 +186,63 @@ def save_google_trade(trade, exit_time, exit_price, reason, nifty_exit, pcr_exit
             trade["atm_pcr_entry"],
             atm_pcr_exit,
             trade["max_pain_entry"],
-            max_pain_exit
+            max_pain_exit,
+            trade.get("pcr_change_entry", ""),
+            trade.get("atm_pcr_change_entry", ""),
+            trade.get("entry_trigger", ""),
+            exit_trigger,
+            duration
+        ]
+
+        with open(PAPER_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+    except Exception as e:
+        print("Paper Trade Save Error:", e)
+        log_error(str(e))
+
+
+# ============================
+# SAVE GOOGLE SHEET TRADE
+# ============================
+def save_google_trade(
+    trade, exit_time, exit_price, exit_reason, exit_trigger,
+    nifty_exit, pcr_exit, atm_pcr_exit, max_pain_exit
+):
+    try:
+        if google_sheet is None:
+            print("Google Sheet not connected")
+            return
+
+        points = round(exit_price - trade["entry_price"], 2)
+        result = "PROFIT" if points > 0 else "LOSS" if points < 0 else "NO PROFIT NO LOSS"
+        duration = get_trade_duration_minutes(trade["entry_time"], exit_time)
+
+        row = [
+            trade["entry_time"],
+            exit_time,
+            trade["trade_type"],
+            trade["symbol"],
+            trade["token"],
+            trade["entry_price"],
+            exit_price,
+            points,
+            result,
+            exit_reason,
+            trade["nifty_entry"],
+            nifty_exit,
+            trade["pcr_entry"],
+            pcr_exit,
+            trade["atm_pcr_entry"],
+            atm_pcr_exit,
+            trade["max_pain_entry"],
+            max_pain_exit,
+            trade.get("pcr_change_entry", ""),
+            trade.get("atm_pcr_change_entry", ""),
+            trade.get("entry_trigger", ""),
+            exit_trigger,
+            duration
         ]
 
         google_sheet.append_row(row, value_input_option="USER_ENTERED")
@@ -255,9 +275,7 @@ def login():
             return False
 
         smartApi = SmartConnect(api_key)
-
         totp = pyotp.TOTP(totp_key).now()
-
         data = smartApi.generateSession(client_id, password, totp)
 
         if data and data.get("status"):
@@ -265,10 +283,9 @@ def login():
             send_telegram("🌅 PCR SYSTEM STARTED SUCCESSFULLY")
             return True
 
-        else:
-            print("LOGIN FAILED:", data)
-            send_telegram(f"❌ LOGIN FAILED\n{data}")
-            return False
+        print("LOGIN FAILED:", data)
+        send_telegram(f"❌ LOGIN FAILED\n{data}")
+        return False
 
     except Exception as e:
         print("LOGIN ERROR:", e)
@@ -344,7 +361,7 @@ while True:
         time_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
         # ============================
-        # FIXED HEARTBEAT
+        # HEARTBEAT
         # ============================
         if now.hour % 2 == 0 and last_heartbeat_hour != now.hour:
             send_telegram(f"✅ BOT RUNNING HEALTHY\nTime: {time_str}")
@@ -408,11 +425,7 @@ while True:
             continue
 
         expiry = exp_list[0][0]
-
-        filtered = [
-            o for o in opts
-            if o["expiry"] == expiry
-        ]
+        filtered = [o for o in opts if o["expiry"] == expiry]
 
         atm = round(nifty / 50) * 50
 
@@ -456,10 +469,8 @@ while True:
 
         total_ce = 0
         total_pe = 0
-
         atm_ce = 0
         atm_pe = 0
-
         strike_data = {}
 
         for item in fetched:
@@ -473,10 +484,7 @@ while True:
                 continue
 
             if strike not in strike_data:
-                strike_data[strike] = {
-                    "ce": 0,
-                    "pe": 0
-                }
+                strike_data[strike] = {"ce": 0, "pe": 0}
 
             if sym.endswith("CE"):
                 total_ce += oi
@@ -515,7 +523,25 @@ while True:
         )
 
         # ============================
-        # OUTPUT SAME FORMAT
+        # 3 MINUTE SAMPLE CHANGE
+        # ============================
+        sample_due = False
+        pcr_change_3min = 0
+        atm_pcr_change_3min = 0
+
+        if sample_pcr is None or sample_atm_pcr is None or last_pcr_sample_time is None:
+            sample_pcr = pcr
+            sample_atm_pcr = atm_pcr
+            last_pcr_sample_time = now
+            print("PCR sample initialized")
+
+        elif (now - last_pcr_sample_time).total_seconds() >= PCR_SAMPLE_SECONDS:
+            sample_due = True
+            pcr_change_3min = round(pcr - sample_pcr, 4)
+            atm_pcr_change_3min = round(atm_pcr - sample_atm_pcr, 4)
+
+        # ============================
+        # OUTPUT
         # ============================
         print("\n============================")
         print("Time:", time_str)
@@ -523,6 +549,7 @@ while True:
         print("============================")
         print("NIFTY:", round(nifty, 2))
         print("PCR:", round(pcr, 4), "| ATM PCR:", round(atm_pcr, 4))
+        print("3 Min PCR Change:", pcr_change_3min, "| 3 Min ATM PCR Change:", atm_pcr_change_3min)
         print("Max Pain:", max_pain)
 
         # ============================
@@ -539,6 +566,8 @@ while True:
             if atm_pe_symbol and atm_pe_token:
                 put_price = safe_ltp("NFO", atm_pe_symbol, atm_pe_token)
 
+            exited_this_loop = False
+
             # ============================
             # EXIT LOGIC
             # ============================
@@ -554,18 +583,49 @@ while True:
                     points = round(current_price - open_trade["entry_price"], 2)
 
                     exit_reason = None
+                    exit_trigger = None
 
                     if points <= -STOPLOSS_POINTS:
                         exit_reason = "STOPLOSS HIT"
+                        exit_trigger = f"OPTION POINTS {points}"
 
                     elif points >= TARGET_POINTS:
                         exit_reason = "TARGET HIT"
+                        exit_trigger = f"OPTION POINTS {points}"
 
-                    elif open_trade["trade_type"] == "BUY CE" and atm_pcr < 1.00:
-                        exit_reason = "CALL EXIT - ATM PCR WEAK"
+                    elif sample_due:
 
-                    elif open_trade["trade_type"] == "BUY PE" and atm_pcr > 1.00:
-                        exit_reason = "PUT EXIT - ATM PCR WEAK"
+                        if open_trade["trade_type"] == "BUY CE":
+
+                            if pcr_change_3min <= -EXIT_PCR_STRONG_REVERSAL:
+                                exit_reason = "CE EXIT - PCR STRONG DECREASE"
+                                exit_trigger = f"PCR CHANGE {pcr_change_3min}"
+
+                            elif pcr_change_3min < 0:
+                                ce_pcr_decrease_count += 1
+                                exit_trigger = f"PCR DECREASE COUNT {ce_pcr_decrease_count}, CHANGE {pcr_change_3min}"
+
+                                if ce_pcr_decrease_count >= 2:
+                                    exit_reason = "CE EXIT - PCR DECREASED TWICE"
+
+                            else:
+                                ce_pcr_decrease_count = 0
+
+                        elif open_trade["trade_type"] == "BUY PE":
+
+                            if pcr_change_3min >= EXIT_PCR_STRONG_REVERSAL:
+                                exit_reason = "PE EXIT - PCR STRONG INCREASE"
+                                exit_trigger = f"PCR CHANGE {pcr_change_3min}"
+
+                            elif pcr_change_3min > 0:
+                                pe_pcr_increase_count += 1
+                                exit_trigger = f"PCR INCREASE COUNT {pe_pcr_increase_count}, CHANGE {pcr_change_3min}"
+
+                                if pe_pcr_increase_count >= 2:
+                                    exit_reason = "PE EXIT - PCR INCREASED TWICE"
+
+                            else:
+                                pe_pcr_increase_count = 0
 
                     if exit_reason:
                         save_paper_trade(
@@ -573,6 +633,7 @@ while True:
                             time_str,
                             round(current_price, 2),
                             exit_reason,
+                            exit_trigger,
                             round(nifty, 2),
                             round(pcr, 4),
                             round(atm_pcr, 4),
@@ -584,6 +645,7 @@ while True:
                             time_str,
                             round(current_price, 2),
                             exit_reason,
+                            exit_trigger,
                             round(nifty, 2),
                             round(pcr, 4),
                             round(atm_pcr, 4),
@@ -598,24 +660,33 @@ while True:
                             f"Exit: {round(current_price, 2)}\n"
                             f"Points: {points}\n"
                             f"Reason: {exit_reason}\n"
+                            f"Trigger: {exit_trigger}\n"
+                            f"PCR Change 3m: {pcr_change_3min}\n"
+                            f"ATM PCR Change 3m: {atm_pcr_change_3min}\n"
                             f"Time: {time_str}"
                         )
 
                         open_trade = None
+                        ce_pcr_decrease_count = 0
+                        pe_pcr_increase_count = 0
+                        exited_this_loop = True
 
             # ============================
-            # ENTRY LOGIC - FAST TEST MODE
+            # ENTRY LOGIC - 3 MINUTE OR LOGIC
             # ============================
-            if open_trade is None and prev_pcr is not None and prev_atm_pcr is not None:
+            if open_trade is None and sample_due and not exited_this_loop:
 
-                pcr_change = pcr - prev_pcr
+                ce_by_atm = atm_pcr_change_3min >= ENTRY_ATM_PCR_CHANGE
+                ce_by_pcr = pcr_change_3min >= ENTRY_PCR_CHANGE
 
-                # BUY CE LOGIC
-                if (
-                    pcr_change >= MIN_PCR_CHANGE
-                    and atm_pcr >= ATM_PCR_CALL_BUY
-                    and call_price is not None
-                ):
+                if (ce_by_atm or ce_by_pcr) and call_price is not None:
+
+                    if ce_by_atm and ce_by_pcr:
+                        entry_trigger = f"CE OR BOTH: ATM PCR +{atm_pcr_change_3min}, PCR +{pcr_change_3min}"
+                    elif ce_by_atm:
+                        entry_trigger = f"CE OR: ATM PCR +{atm_pcr_change_3min}"
+                    else:
+                        entry_trigger = f"CE OR: PCR +{pcr_change_3min}"
 
                     open_trade = {
                         "entry_time": time_str,
@@ -626,7 +697,10 @@ while True:
                         "nifty_entry": round(nifty, 2),
                         "pcr_entry": round(pcr, 4),
                         "atm_pcr_entry": round(atm_pcr, 4),
-                        "max_pain_entry": max_pain
+                        "max_pain_entry": max_pain,
+                        "pcr_change_entry": pcr_change_3min,
+                        "atm_pcr_change_entry": atm_pcr_change_3min,
+                        "entry_trigger": entry_trigger
                     }
 
                     send_telegram(
@@ -636,41 +710,54 @@ while True:
                         f"NIFTY: {round(nifty, 2)}\n"
                         f"PCR: {round(pcr, 4)}\n"
                         f"ATM PCR: {round(atm_pcr, 4)}\n"
+                        f"PCR Change 3m: {pcr_change_3min}\n"
+                        f"ATM PCR Change 3m: {atm_pcr_change_3min}\n"
                         f"Max Pain: {max_pain}\n"
-                        f"Reason: TEST MODE FAST ENTRY\n"
+                        f"Reason: {entry_trigger}\n"
                         f"Time: {time_str}"
                     )
 
-                # BUY PE LOGIC
-                elif (
-                    pcr_change <= -MIN_PCR_CHANGE
-                    and atm_pcr <= ATM_PCR_PUT_BUY
-                    and put_price is not None
-                ):
+                else:
+                    pe_by_atm = atm_pcr_change_3min <= -ENTRY_ATM_PCR_CHANGE
+                    pe_by_pcr = pcr_change_3min <= -ENTRY_PCR_CHANGE
 
-                    open_trade = {
-                        "entry_time": time_str,
-                        "trade_type": "BUY PE",
-                        "symbol": atm_pe_symbol,
-                        "token": atm_pe_token,
-                        "entry_price": round(put_price, 2),
-                        "nifty_entry": round(nifty, 2),
-                        "pcr_entry": round(pcr, 4),
-                        "atm_pcr_entry": round(atm_pcr, 4),
-                        "max_pain_entry": max_pain
-                    }
+                    if (pe_by_atm or pe_by_pcr) and put_price is not None:
 
-                    send_telegram(
-                        f"🔴 PAPER BUY PE ALERT\n"
-                        f"Symbol: {atm_pe_symbol}\n"
-                        f"Entry Price: {round(put_price, 2)}\n"
-                        f"NIFTY: {round(nifty, 2)}\n"
-                        f"PCR: {round(pcr, 4)}\n"
-                        f"ATM PCR: {round(atm_pcr, 4)}\n"
-                        f"Max Pain: {max_pain}\n"
-                        f"Reason: TEST MODE FAST ENTRY\n"
-                        f"Time: {time_str}"
-                    )
+                        if pe_by_atm and pe_by_pcr:
+                            entry_trigger = f"PE OR BOTH: ATM PCR {atm_pcr_change_3min}, PCR {pcr_change_3min}"
+                        elif pe_by_atm:
+                            entry_trigger = f"PE OR: ATM PCR {atm_pcr_change_3min}"
+                        else:
+                            entry_trigger = f"PE OR: PCR {pcr_change_3min}"
+
+                        open_trade = {
+                            "entry_time": time_str,
+                            "trade_type": "BUY PE",
+                            "symbol": atm_pe_symbol,
+                            "token": atm_pe_token,
+                            "entry_price": round(put_price, 2),
+                            "nifty_entry": round(nifty, 2),
+                            "pcr_entry": round(pcr, 4),
+                            "atm_pcr_entry": round(atm_pcr, 4),
+                            "max_pain_entry": max_pain,
+                            "pcr_change_entry": pcr_change_3min,
+                            "atm_pcr_change_entry": atm_pcr_change_3min,
+                            "entry_trigger": entry_trigger
+                        }
+
+                        send_telegram(
+                            f"🔴 PAPER BUY PE ALERT\n"
+                            f"Symbol: {atm_pe_symbol}\n"
+                            f"Entry Price: {round(put_price, 2)}\n"
+                            f"NIFTY: {round(nifty, 2)}\n"
+                            f"PCR: {round(pcr, 4)}\n"
+                            f"ATM PCR: {round(atm_pcr, 4)}\n"
+                            f"PCR Change 3m: {pcr_change_3min}\n"
+                            f"ATM PCR Change 3m: {atm_pcr_change_3min}\n"
+                            f"Max Pain: {max_pain}\n"
+                            f"Reason: {entry_trigger}\n"
+                            f"Time: {time_str}"
+                        )
 
         # ============================
         # FORCE EXIT AFTER MARKET
@@ -687,6 +774,7 @@ while True:
                     time_str,
                     round(exit_price, 2),
                     "MARKET CLOSED EXIT",
+                    "MARKET CLOSED",
                     round(nifty, 2),
                     round(pcr, 4),
                     round(atm_pcr, 4),
@@ -698,6 +786,7 @@ while True:
                     time_str,
                     round(exit_price, 2),
                     "MARKET CLOSED EXIT",
+                    "MARKET CLOSED",
                     round(nifty, 2),
                     round(pcr, 4),
                     round(atm_pcr, 4),
@@ -716,12 +805,16 @@ while True:
                 )
 
                 open_trade = None
+                ce_pcr_decrease_count = 0
+                pe_pcr_increase_count = 0
 
         # ============================
-        # UPDATE PREVIOUS VALUES
+        # UPDATE 3 MINUTE SAMPLE
         # ============================
-        prev_pcr = pcr
-        prev_atm_pcr = atm_pcr
+        if sample_due:
+            sample_pcr = pcr
+            sample_atm_pcr = atm_pcr
+            last_pcr_sample_time = now
 
     except Exception as e:
         print("MAIN LOOP ERROR:", e)
