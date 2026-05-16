@@ -41,6 +41,8 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 # STRATEGY SETTINGS
 # ==========================================================
 SLEEP_SECONDS = 60
+NIFTY_LOT_QTY = 65
+
 
 # PCR Strategy settings
 PCR_SAMPLE_SECONDS = 180
@@ -72,6 +74,27 @@ ADX_BREAKEVEN_PERCENT = 15         # after this profit, SL moves to cost
 ADX_VWAP_FILTER = True
 ADX_FALL_EXIT_CANDLES = 2          # exit if ADX falls for 2 candles
 
+# RSI + Stochastic + EMA Strategy settings
+RSI_STOCH_EMA_ENABLED = True
+RSI_STOCH_EMA_NAME = "RSI_STOCH_EMA"
+EMA_FAST_PERIOD = 25
+EMA_MID_PERIOD = 75
+EMA_SLOW_PERIOD = 140
+RSI_PERIOD = 14
+RSI_BULL_LEVEL = 55
+RSI_BEAR_LEVEL = 45
+STOCH_K_PERIOD = 14
+STOCH_K_SMOOTH = 3
+STOCH_D_PERIOD = 3
+STOCH_CE_MAX_LEVEL = 40      # CE entry only when Stochastic pullback is not already overbought
+STOCH_PE_MIN_LEVEL = 60      # PE entry only when Stochastic pullback is not already oversold
+RSI_STOCH_MIN_CANDLES_REQUIRED = 150
+RSI_STOCH_USE_VWAP_FILTER = True
+RSI_STOCH_ENTRY_START_HOUR = 9
+RSI_STOCH_ENTRY_START_MINUTE = 20
+RSI_STOCH_ENTRY_END_HOUR = 15
+RSI_STOCH_ENTRY_END_MINUTE = 15
+
 # PCR sample variables
 last_pcr_sample_time = None
 sample_pcr = None
@@ -95,7 +118,7 @@ last_smc_entry_time = None
 # CSV / GOOGLE SHEET HEADERS
 # ==========================================================
 HEADERS = [
-    "Trade ID", "Strategy Name", "Entry Time", "Exit Time", "Trade Type", "Symbol", "Token",
+    "Trade ID", "Strategy Name", "Entry Time", "Exit Time", "Trade Type", "Quantity", "Symbol", "Token",
     "Entry Price", "Exit Price", "Points", "Result", "Exit Reason",
     "NIFTY Entry", "NIFTY Exit", "PCR Entry", "PCR Exit",
     "ATM PCR Entry", "ATM PCR Exit", "Max Pain Entry", "Max Pain Exit",
@@ -266,6 +289,7 @@ def build_completed_trade_row(trade, exit_time, exit_price, exit_reason, exit_tr
         trade["entry_time"],
         exit_time,
         trade["trade_type"],
+        trade.get("quantity", NIFTY_LOT_QTY),
         trade["symbol"],
         trade["token"],
         trade["entry_price"],
@@ -346,7 +370,7 @@ def login():
 
         if data and data.get("status"):
             print("LOGIN SUCCESS")
-            send_telegram("🌅 MULTI STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
+            send_telegram("🌅 4 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
             return True
 
         print("LOGIN FAILED:", data)
@@ -699,6 +723,221 @@ def check_adx_exit(trade, current_price, nifty):
 
     return None, None
 
+
+# ==========================================================
+# RSI + STOCHASTIC + EMA STRATEGY HELPERS
+# ==========================================================
+def calculate_ema_series(values, period):
+    if values is None or len(values) < period:
+        return []
+    multiplier = 2 / (period + 1)
+    ema_values = []
+    ema = sum(values[:period]) / period
+    ema_values.append(ema)
+    for price in values[period:]:
+        ema = (price - ema) * multiplier + ema
+        ema_values.append(ema)
+    return ema_values
+
+
+def calculate_rsi_series(closes, period=14):
+    if closes is None or len(closes) < period + 2:
+        return []
+
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0))
+        losses.append(abs(min(change, 0)))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsi_values = []
+
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+        if avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+        rsi_values.append(round(rsi, 2))
+
+    return rsi_values
+
+
+def simple_average(values):
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def calculate_stochastic_values(candles, k_period=14, k_smooth=3, d_period=3):
+    if candles is None or len(candles) < k_period + k_smooth + d_period + 2:
+        return []
+
+    raw_k = []
+    for i in range(k_period - 1, len(candles)):
+        window = candles[i - k_period + 1:i + 1]
+        highest_high = max(float(c["high"]) for c in window)
+        lowest_low = min(float(c["low"]) for c in window)
+        close = float(candles[i]["close"])
+        if highest_high == lowest_low:
+            k = 50.0
+        else:
+            k = ((close - lowest_low) / (highest_high - lowest_low)) * 100
+        raw_k.append(k)
+
+    smooth_k = []
+    for i in range(k_smooth - 1, len(raw_k)):
+        smooth_k.append(simple_average(raw_k[i - k_smooth + 1:i + 1]))
+
+    output = []
+    for i in range(d_period - 1, len(smooth_k)):
+        d = simple_average(smooth_k[i - d_period + 1:i + 1])
+        output.append({"k": round(smooth_k[i], 2), "d": round(d, 2)})
+
+    return output
+
+
+def get_latest_rsi_stoch_ema_state():
+    candles = get_all_working_candles()
+    if len(candles) < RSI_STOCH_MIN_CANDLES_REQUIRED:
+        return None
+
+    closes = [float(c["close"]) for c in candles]
+    ema25 = calculate_ema_series(closes, EMA_FAST_PERIOD)
+    ema75 = calculate_ema_series(closes, EMA_MID_PERIOD)
+    ema140 = calculate_ema_series(closes, EMA_SLOW_PERIOD)
+    rsi_values = calculate_rsi_series(closes, RSI_PERIOD)
+    stoch_values = calculate_stochastic_values(candles, STOCH_K_PERIOD, STOCH_K_SMOOTH, STOCH_D_PERIOD)
+
+    if not ema25 or not ema75 or not ema140 or len(rsi_values) < 2 or len(stoch_values) < 2:
+        return None
+
+    return {
+        "ema25": round(ema25[-1], 2),
+        "ema75": round(ema75[-1], 2),
+        "ema140": round(ema140[-1], 2),
+        "rsi": round(rsi_values[-1], 2),
+        "prev_rsi": round(rsi_values[-2], 2),
+        "stoch_k": round(stoch_values[-1]["k"], 2),
+        "stoch_d": round(stoch_values[-1]["d"], 2),
+        "prev_stoch_k": round(stoch_values[-2]["k"], 2),
+        "prev_stoch_d": round(stoch_values[-2]["d"], 2),
+        "close": round(closes[-1], 2)
+    }
+
+
+def rsi_stoch_entry_time_ok(now):
+    start_ok = (now.hour > RSI_STOCH_ENTRY_START_HOUR) or (
+        now.hour == RSI_STOCH_ENTRY_START_HOUR and now.minute >= RSI_STOCH_ENTRY_START_MINUTE
+    )
+    end_ok = (now.hour < RSI_STOCH_ENTRY_END_HOUR) or (
+        now.hour == RSI_STOCH_ENTRY_END_HOUR and now.minute <= RSI_STOCH_ENTRY_END_MINUTE
+    )
+    return start_ok and end_ok
+
+
+def get_rsi_stoch_ema_signal(nifty, now):
+    """
+    Strategy-4 RSI + Stochastic + EMA:
+    BUY CE: EMA25 > EMA75 > EMA140 + RSI > 55 + Stoch K crosses above D from pullback zone.
+    BUY PE: EMA25 < EMA75 < EMA140 + RSI < 45 + Stoch K crosses below D from pullback zone.
+    """
+    if not RSI_STOCH_EMA_ENABLED:
+        return None, None
+
+    if not rsi_stoch_entry_time_ok(now):
+        return None, None
+
+    state = get_latest_rsi_stoch_ema_state()
+    if state is None:
+        return None, None
+
+    price = float(nifty)
+    ema25 = state["ema25"]
+    ema75 = state["ema75"]
+    ema140 = state["ema140"]
+    rsi = state["rsi"]
+    k = state["stoch_k"]
+    d = state["stoch_d"]
+    prev_k = state["prev_stoch_k"]
+    prev_d = state["prev_stoch_d"]
+
+    bullish_ema = ema25 > ema75 > ema140
+    bearish_ema = ema25 < ema75 < ema140
+    bullish_cross = prev_k <= prev_d and k > d
+    bearish_cross = prev_k >= prev_d and k < d
+
+    above_vwap = True
+    below_vwap = True
+    if RSI_STOCH_USE_VWAP_FILTER:
+        if current_vwap is None:
+            return None, None
+        above_vwap = price > float(current_vwap)
+        below_vwap = price < float(current_vwap)
+
+    if bullish_ema and price > ema25 and rsi >= RSI_BULL_LEVEL and bullish_cross and k <= STOCH_CE_MAX_LEVEL and above_vwap:
+        trigger = (
+            f"RSI_STOCH_EMA BUY CE: EMA25 {ema25} > EMA75 {ema75} > EMA140 {ema140}, "
+            f"RSI {rsi} >= {RSI_BULL_LEVEL}, Stoch K {k} crossed above D {d}, "
+            f"NIFTY {round(price, 2)} above EMA25 and VWAP {current_vwap}"
+        )
+        return "BUY CE", trigger
+
+    if bearish_ema and price < ema25 and rsi <= RSI_BEAR_LEVEL and bearish_cross and k >= STOCH_PE_MIN_LEVEL and below_vwap:
+        trigger = (
+            f"RSI_STOCH_EMA BUY PE: EMA25 {ema25} < EMA75 {ema75} < EMA140 {ema140}, "
+            f"RSI {rsi} <= {RSI_BEAR_LEVEL}, Stoch K {k} crossed below D {d}, "
+            f"NIFTY {round(price, 2)} below EMA25 and VWAP {current_vwap}"
+        )
+        return "BUY PE", trigger
+
+    return None, None
+
+
+def check_rsi_stoch_ema_exit(trade, nifty):
+    state = get_latest_rsi_stoch_ema_state()
+    if state is None:
+        return None, None
+
+    price = float(nifty)
+    ema25 = state["ema25"]
+    ema75 = state["ema75"]
+    rsi = state["rsi"]
+    k = state["stoch_k"]
+    d = state["stoch_d"]
+    prev_k = state["prev_stoch_k"]
+    prev_d = state["prev_stoch_d"]
+
+    bearish_cross = prev_k >= prev_d and k < d
+    bullish_cross = prev_k <= prev_d and k > d
+
+    if trade["trade_type"] == "BUY CE":
+        if rsi < 50:
+            return "RSI_STOCH_EMA CE RSI EXIT", f"RSI {rsi} below 50"
+        if bearish_cross:
+            return "RSI_STOCH_EMA CE STOCH REVERSAL", f"Stoch K {k} crossed below D {d}"
+        if price < ema25:
+            return "RSI_STOCH_EMA CE EMA EXIT", f"NIFTY {round(price,2)} below EMA25 {ema25}"
+        if ema25 < ema75:
+            return "RSI_STOCH_EMA CE TREND EXIT", f"EMA25 {ema25} below EMA75 {ema75}"
+
+    elif trade["trade_type"] == "BUY PE":
+        if rsi > 50:
+            return "RSI_STOCH_EMA PE RSI EXIT", f"RSI {rsi} above 50"
+        if bullish_cross:
+            return "RSI_STOCH_EMA PE STOCH REVERSAL", f"Stoch K {k} crossed above D {d}"
+        if price > ema25:
+            return "RSI_STOCH_EMA PE EMA EXIT", f"NIFTY {round(price,2)} above EMA25 {ema25}"
+        if ema25 > ema75:
+            return "RSI_STOCH_EMA PE TREND EXIT", f"EMA25 {ema25} above EMA75 {ema75}"
+
+    return None, None
+
 # ==========================================================
 # OPTION MASTER HELPERS
 # ==========================================================
@@ -847,6 +1086,10 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
         exit_reason = "TARGET HIT"
         exit_trigger = f"OPTION POINTS {points}"
 
+    # Extra RSI + Stochastic + EMA exit only for Strategy-4
+    elif strategy_name == RSI_STOCH_EMA_NAME:
+        exit_reason, exit_trigger = check_rsi_stoch_ema_exit(trade, nifty)
+
     # Extra PCR reversal exit only for PCR strategy
     elif strategy_name == "PCR" and sample_due:
         if trade["trade_type"] == "BUY CE":
@@ -892,6 +1135,7 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
         f"Strategy: {strategy_name}\n"
         f"Trade ID: {trade.get('trade_id', '')}\n"
         f"Type: {trade['trade_type']}\n"
+        f"Quantity: {trade.get('quantity', NIFTY_LOT_QTY)}\n"
         f"Symbol: {trade['symbol']}\n"
         f"Entry: {trade['entry_price']}\n"
         f"Exit: {round(current_price, 2)}\n"
@@ -916,6 +1160,7 @@ def create_trade(strategy_name, trade_type, symbol, token, price, time_str, nift
         "strategy_name": strategy_name,
         "entry_time": time_str,
         "trade_type": trade_type,
+        "quantity": NIFTY_LOT_QTY,
         "symbol": symbol,
         "token": token,
         "entry_price": round(price, 2),
@@ -938,6 +1183,7 @@ def enter_trade(strategy_name, trade):
         f"Strategy: {strategy_name}\n"
         f"Trade ID: {trade.get('trade_id', '')}\n"
         f"Type: {trade['trade_type']}\n"
+        f"Quantity: {trade.get('quantity', NIFTY_LOT_QTY)}\n"
         f"Symbol: {trade['symbol']}\n"
         f"Entry Price: {trade['entry_price']}\n"
         f"NIFTY: {trade.get('nifty_entry')}\n"
@@ -1028,6 +1274,20 @@ while True:
             print("ADX:", adx_state["adx"], "| +DI:", adx_state["plus_di"], "| -DI:", adx_state["minus_di"])
         else:
             print("ADX: collecting candles")
+
+        rsi_stoch_state = get_latest_rsi_stoch_ema_state()
+        if rsi_stoch_state:
+            print(
+                "RSI_STOCH_EMA:",
+                "EMA25", rsi_stoch_state["ema25"],
+                "EMA75", rsi_stoch_state["ema75"],
+                "EMA140", rsi_stoch_state["ema140"],
+                "RSI", rsi_stoch_state["rsi"],
+                "K", rsi_stoch_state["stoch_k"],
+                "D", rsi_stoch_state["stoch_d"]
+            )
+        else:
+            print("RSI_STOCH_EMA: collecting candles")
 
         call_price = None
         put_price = None
@@ -1124,6 +1384,24 @@ while True:
                     )
                     enter_trade("ADX", trade)
 
+            # 5) Strategy-4 RSI + Stochastic + EMA entry
+            if RSI_STOCH_EMA_NAME not in open_trades and RSI_STOCH_EMA_NAME not in exited_strategies:
+                rsi_stoch_signal, rsi_stoch_trigger = get_rsi_stoch_ema_signal(nifty, now)
+
+                if rsi_stoch_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        RSI_STOCH_EMA_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, rsi_stoch_trigger
+                    )
+                    enter_trade(RSI_STOCH_EMA_NAME, trade)
+
+                elif rsi_stoch_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        RSI_STOCH_EMA_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, rsi_stoch_trigger
+                    )
+                    enter_trade(RSI_STOCH_EMA_NAME, trade)
+
         # ==================================================
         # FORCE EXIT AFTER MARKET FOR ALL OPEN TRADES
         # ==================================================
@@ -1150,6 +1428,7 @@ while True:
                     f"Strategy: {strategy_name}\n"
                     f"Trade ID: {trade.get('trade_id', '')}\n"
                     f"Type: {trade['trade_type']}\n"
+                    f"Quantity: {trade.get('quantity', NIFTY_LOT_QTY)}\n"
                     f"Symbol: {trade['symbol']}\n"
                     f"Entry: {trade['entry_price']}\n"
                     f"Exit: {round(exit_price, 2)}\n"
