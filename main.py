@@ -125,6 +125,29 @@ SUPER_EMA_LOCK2_SL_PERCENT = 20        # lock +20% profit
 SUPER_EMA_TRAIL_START_PERCENT = 50     # after +50%, trail from highest premium
 SUPER_EMA_TRAIL_GAP_PERCENT = 10       # trailing SL gap from highest premium
 
+# Gamma Blast Expiry Strategy settings - Strategy 7
+# Paper-trade only. Works only on expiry day from 1:30 PM to 3:05 PM.
+GAMMA_BLAST_ENABLED = True
+GAMMA_BLAST_NAME = "GAMMA_BLAST"
+GAMMA_BLAST_QTY = NIFTY_LOT_QTY * 10          # 10 lots = 650 quantity
+GAMMA_ENTRY_START_HOUR = 13
+GAMMA_ENTRY_START_MINUTE = 30
+GAMMA_ENTRY_END_HOUR = 15
+GAMMA_ENTRY_END_MINUTE = 5
+GAMMA_FORCE_EXIT_HOUR = 15
+GAMMA_FORCE_EXIT_MINUTE = 8
+GAMMA_MIN_NIFTY_MOVE_POINTS = 8               # direction pressure from previous snapshot
+GAMMA_MIN_OI_UNWIND_PERCENT = 3.0             # writer unwinding side
+GAMMA_MIN_OPPOSITE_OI_ADD_PERCENT = 2.0       # support side addition
+GAMMA_MIN_PREMIUM_JUMP_PERCENT = 8.0          # next OTM premium velocity
+GAMMA_MIN_CANDLE_BODY_POINTS = 5
+GAMMA_MIN_CANDLE_EXPANSION_MULTIPLIER = 1.4
+GAMMA_COOLDOWN_SECONDS = 900                  # 15 minutes after one Gamma trade
+GAMMA_OPTION_HARD_SL_PERCENT = 25             # emergency premium SL
+GAMMA_OPTION_PROFIT_COLLAPSE_PERCENT = 18     # exit if premium falls from highest
+GAMMA_OI_REVERSAL_PERCENT = 2.0               # exit when writers come back
+GAMMA_MIN_CONFIRMATION_SCORE = 5              # OI unwinding is mandatory; score filters fake moves
+
 # PCR sample variables
 last_pcr_sample_time = None
 sample_pcr = None
@@ -151,6 +174,11 @@ last_market_structure_signal_key = None
 # Supertrend + EMA variables
 last_super_ema_entry_time = None
 last_super_ema_signal_key = None
+
+# Gamma Blast variables
+last_gamma_entry_time = None
+gamma_snapshot = None
+last_gamma_signal_key = None
 
 # ==========================================================
 # CSV / GOOGLE SHEET HEADERS
@@ -408,7 +436,7 @@ def login():
 
         if data and data.get("status"):
             print("LOGIN SUCCESS")
-            send_telegram("🌅 6 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
+            send_telegram("🌅 7 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
             return True
 
         print("LOGIN FAILED:", data)
@@ -1403,15 +1431,44 @@ def get_option_context(symbols, now, nifty):
     atm_ce_token = None
     atm_pe_symbol = None
     atm_pe_token = None
+    next_otm_ce_symbol = None
+    next_otm_ce_token = None
+    next_otm_pe_symbol = None
+    next_otm_pe_token = None
+
+    next_otm_ce_strike = atm + 50
+    next_otm_pe_strike = atm - 50
+
+    option_by_token = {}
+    token_by_strike_type = {}
 
     for o in filtered:
         strike = int(float(o["strike"]) / 100)
+        opt_type = "CE" if o["symbol"].endswith("CE") else "PE" if o["symbol"].endswith("PE") else ""
+        if opt_type:
+            option_by_token[o["token"]] = {
+                "symbol": o["symbol"],
+                "token": o["token"],
+                "strike": strike,
+                "type": opt_type,
+                "oi": 0,
+                "volume": 0,
+                "ltp": 0
+            }
+            token_by_strike_type[(strike, opt_type)] = o["token"]
+
         if strike == atm and o["symbol"].endswith("CE"):
             atm_ce_symbol = o["symbol"]
             atm_ce_token = o["token"]
         if strike == atm and o["symbol"].endswith("PE"):
             atm_pe_symbol = o["symbol"]
             atm_pe_token = o["token"]
+        if strike == next_otm_ce_strike and o["symbol"].endswith("CE"):
+            next_otm_ce_symbol = o["symbol"]
+            next_otm_ce_token = o["token"]
+        if strike == next_otm_pe_strike and o["symbol"].endswith("PE"):
+            next_otm_pe_symbol = o["symbol"]
+            next_otm_pe_token = o["token"]
 
     fetched = []
     for i in range(0, len(tokens), 50):
@@ -1432,8 +1489,20 @@ def get_option_context(symbols, now, nifty):
     for item in fetched:
         sym = item.get("tradingSymbol", "")
         oi = item.get("opnInterest", 0) or 0
+        volume = item.get("tradeVolume", item.get("volume", 0)) or 0
+        ltp = item.get("ltp", item.get("lastPrice", 0)) or 0
         tk = item.get("symbolToken")
         strike = strike_map.get(tk)
+        if tk in option_by_token:
+            option_by_token[tk]["oi"] = int(oi)
+            try:
+                option_by_token[tk]["volume"] = int(volume)
+            except Exception:
+                option_by_token[tk]["volume"] = 0
+            try:
+                option_by_token[tk]["ltp"] = float(ltp)
+            except Exception:
+                option_by_token[tk]["ltp"] = 0
         if strike is None:
             continue
 
@@ -1474,16 +1543,302 @@ def get_option_context(symbols, now, nifty):
         "atm_ce_symbol": atm_ce_symbol,
         "atm_ce_token": atm_ce_token,
         "atm_pe_symbol": atm_pe_symbol,
-        "atm_pe_token": atm_pe_token
+        "atm_pe_token": atm_pe_token,
+        "next_otm_ce_symbol": next_otm_ce_symbol,
+        "next_otm_ce_token": next_otm_ce_token,
+        "next_otm_pe_symbol": next_otm_pe_symbol,
+        "next_otm_pe_token": next_otm_pe_token,
+        "next_otm_ce_strike": next_otm_ce_strike,
+        "next_otm_pe_strike": next_otm_pe_strike,
+        "option_by_token": option_by_token,
+        "token_by_strike_type": token_by_strike_type
     }
+
+
+# ==========================================================
+# GAMMA BLAST EXPIRY STRATEGY HELPERS - STRATEGY 7
+# ==========================================================
+def parse_expiry_date(expiry_text):
+    try:
+        return datetime.strptime(expiry_text, "%d%b%Y").date()
+    except Exception:
+        return None
+
+
+def is_gamma_expiry_day(now, context):
+    expiry_date = parse_expiry_date(context.get("expiry", ""))
+    return expiry_date is not None and expiry_date == now.date()
+
+
+def gamma_entry_time_ok(now):
+    start_ok = (now.hour > GAMMA_ENTRY_START_HOUR) or (
+        now.hour == GAMMA_ENTRY_START_HOUR and now.minute >= GAMMA_ENTRY_START_MINUTE
+    )
+    end_ok = (now.hour < GAMMA_ENTRY_END_HOUR) or (
+        now.hour == GAMMA_ENTRY_END_HOUR and now.minute <= GAMMA_ENTRY_END_MINUTE
+    )
+    return start_ok and end_ok
+
+
+def gamma_force_exit_time(now):
+    return (now.hour > GAMMA_FORCE_EXIT_HOUR) or (
+        now.hour == GAMMA_FORCE_EXIT_HOUR and now.minute >= GAMMA_FORCE_EXIT_MINUTE
+    )
+
+
+def gamma_cooldown_ok(now):
+    if last_gamma_entry_time is None:
+        return True
+    try:
+        return (now - last_gamma_entry_time).total_seconds() >= GAMMA_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+
+def percent_change(current, previous):
+    try:
+        current = float(current)
+        previous = float(previous)
+        if previous == 0:
+            return 0.0
+        return round(((current - previous) / previous) * 100, 2)
+    except Exception:
+        return 0.0
+
+
+def get_avg_recent_candle_range(count=5):
+    try:
+        if len(nifty_candles) < count:
+            return None
+        recent = nifty_candles[-count:]
+        ranges = [abs(float(c["high"]) - float(c["low"])) for c in recent]
+        return sum(ranges) / len(ranges)
+    except Exception:
+        return None
+
+
+def build_gamma_snapshot(context, nifty, call_price, put_price):
+    option_by_token = context.get("option_by_token", {})
+    atm_ce_token = context.get("atm_ce_token")
+    atm_pe_token = context.get("atm_pe_token")
+    otm_ce_token = context.get("next_otm_ce_token")
+    otm_pe_token = context.get("next_otm_pe_token")
+
+    atm_ce = option_by_token.get(atm_ce_token, {})
+    atm_pe = option_by_token.get(atm_pe_token, {})
+    otm_ce = option_by_token.get(otm_ce_token, {})
+    otm_pe = option_by_token.get(otm_pe_token, {})
+
+    return {
+        "time": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "nifty": round(float(nifty), 2),
+        "atm": context.get("atm"),
+        "expiry": context.get("expiry"),
+        "atm_ce_oi": int(atm_ce.get("oi", 0) or 0),
+        "atm_pe_oi": int(atm_pe.get("oi", 0) or 0),
+        "otm_ce_oi": int(otm_ce.get("oi", 0) or 0),
+        "otm_pe_oi": int(otm_pe.get("oi", 0) or 0),
+        "otm_ce_price": float(call_price or otm_ce.get("ltp", 0) or 0),
+        "otm_pe_price": float(put_price or otm_pe.get("ltp", 0) or 0),
+        "otm_ce_symbol": context.get("next_otm_ce_symbol"),
+        "otm_ce_token": context.get("next_otm_ce_token"),
+        "otm_pe_symbol": context.get("next_otm_pe_symbol"),
+        "otm_pe_token": context.get("next_otm_pe_token")
+    }
+
+
+def update_gamma_snapshot(context, nifty, otm_call_price, otm_put_price):
+    global gamma_snapshot
+    gamma_snapshot = build_gamma_snapshot(context, nifty, otm_call_price, otm_put_price)
+
+
+def get_gamma_signal(context, nifty, otm_call_price, otm_put_price, now):
+    """
+    Pre-Gamma Blast logic:
+    CE setup requires NIFTY rising + Call OI unwinding + next OTM CE premium velocity.
+    PE setup requires NIFTY falling + Put OI unwinding + next OTM PE premium velocity.
+    Entry is NEXT OTM strike only.
+    """
+    global gamma_snapshot, last_gamma_signal_key
+
+    if not GAMMA_BLAST_ENABLED:
+        return None, None, None, None
+
+    if not is_gamma_expiry_day(now, context):
+        return None, None, None, None
+
+    if not gamma_entry_time_ok(now):
+        return None, None, None, None
+
+    if gamma_snapshot is None:
+        update_gamma_snapshot(context, nifty, otm_call_price, otm_put_price)
+        return None, None, None, None
+
+    if current_candle is None or len(nifty_candles) < 5:
+        return None, None, None, None
+
+    snap = gamma_snapshot
+    option_by_token = context.get("option_by_token", {})
+    atm_ce = option_by_token.get(context.get("atm_ce_token"), {})
+    atm_pe = option_by_token.get(context.get("atm_pe_token"), {})
+    otm_ce = option_by_token.get(context.get("next_otm_ce_token"), {})
+    otm_pe = option_by_token.get(context.get("next_otm_pe_token"), {})
+
+    current_atm_ce_oi = int(atm_ce.get("oi", 0) or 0)
+    current_atm_pe_oi = int(atm_pe.get("oi", 0) or 0)
+    current_otm_ce_oi = int(otm_ce.get("oi", 0) or 0)
+    current_otm_pe_oi = int(otm_pe.get("oi", 0) or 0)
+
+    ce_oi_change = percent_change(current_atm_ce_oi, snap.get("atm_ce_oi", 0))
+    pe_oi_change = percent_change(current_atm_pe_oi, snap.get("atm_pe_oi", 0))
+    otm_ce_oi_change = percent_change(current_otm_ce_oi, snap.get("otm_ce_oi", 0))
+    otm_pe_oi_change = percent_change(current_otm_pe_oi, snap.get("otm_pe_oi", 0))
+    nifty_move = round(float(nifty) - float(snap.get("nifty", nifty)), 2)
+    ce_premium_change = percent_change(otm_call_price, snap.get("otm_ce_price", 0))
+    pe_premium_change = percent_change(otm_put_price, snap.get("otm_pe_price", 0))
+
+    candle_open = float(current_candle["open"])
+    candle_close = float(nifty)
+    candle_body = abs(candle_close - candle_open)
+    avg_range = get_avg_recent_candle_range(5)
+    candle_range = abs(float(current_candle["high"]) - float(current_candle["low"]))
+    candle_expanding = avg_range is not None and candle_range >= (avg_range * GAMMA_MIN_CANDLE_EXPANSION_MULTIPLIER)
+
+    above_vwap = current_vwap is not None and float(nifty) > float(current_vwap)
+    below_vwap = current_vwap is not None and float(nifty) < float(current_vwap)
+
+    bullish_candle = candle_close > candle_open and candle_body >= GAMMA_MIN_CANDLE_BODY_POINTS
+    bearish_candle = candle_close < candle_open and candle_body >= GAMMA_MIN_CANDLE_BODY_POINTS
+
+    ce_oi_unwinding = ce_oi_change <= -GAMMA_MIN_OI_UNWIND_PERCENT or otm_ce_oi_change <= -GAMMA_MIN_OI_UNWIND_PERCENT
+    pe_oi_unwinding = pe_oi_change <= -GAMMA_MIN_OI_UNWIND_PERCENT or otm_pe_oi_change <= -GAMMA_MIN_OI_UNWIND_PERCENT
+
+    ce_score = 0
+    if nifty_move >= GAMMA_MIN_NIFTY_MOVE_POINTS: ce_score += 1
+    if ce_oi_unwinding: ce_score += 2
+    if pe_oi_change >= GAMMA_MIN_OPPOSITE_OI_ADD_PERCENT: ce_score += 1
+    if ce_premium_change >= GAMMA_MIN_PREMIUM_JUMP_PERCENT: ce_score += 1
+    if bullish_candle: ce_score += 1
+    if candle_expanding: ce_score += 1
+    if above_vwap: ce_score += 1
+
+    pe_score = 0
+    if nifty_move <= -GAMMA_MIN_NIFTY_MOVE_POINTS: pe_score += 1
+    if pe_oi_unwinding: pe_score += 2
+    if ce_oi_change >= GAMMA_MIN_OPPOSITE_OI_ADD_PERCENT: pe_score += 1
+    if pe_premium_change >= GAMMA_MIN_PREMIUM_JUMP_PERCENT: pe_score += 1
+    if bearish_candle: pe_score += 1
+    if candle_expanding: pe_score += 1
+    if below_vwap: pe_score += 1
+
+    minute_key = current_candle.get("minute", now.strftime("%Y-%m-%d %H:%M"))
+
+    if ce_oi_unwinding and ce_score >= GAMMA_MIN_CONFIRMATION_SCORE and otm_call_price is not None and context.get("next_otm_ce_symbol"):
+        key = f"CE_{minute_key}_{context.get('next_otm_ce_symbol')}"
+        if last_gamma_signal_key == key:
+            return None, None, None, None
+        last_gamma_signal_key = key
+        trigger = (
+            f"GAMMA CE: NIFTY +{nifty_move}, Call OI unwinding {ce_oi_change}% "
+            f"(OTM {otm_ce_oi_change}%), PE OI {pe_oi_change}%, "
+            f"OTM CE premium {ce_premium_change}%, Score {ce_score}, VWAP {current_vwap}"
+        )
+        return "BUY CE", context.get("next_otm_ce_symbol"), context.get("next_otm_ce_token"), trigger
+
+    if pe_oi_unwinding and pe_score >= GAMMA_MIN_CONFIRMATION_SCORE and otm_put_price is not None and context.get("next_otm_pe_symbol"):
+        key = f"PE_{minute_key}_{context.get('next_otm_pe_symbol')}"
+        if last_gamma_signal_key == key:
+            return None, None, None, None
+        last_gamma_signal_key = key
+        trigger = (
+            f"GAMMA PE: NIFTY {nifty_move}, Put OI unwinding {pe_oi_change}% "
+            f"(OTM {otm_pe_oi_change}%), CE OI {ce_oi_change}%, "
+            f"OTM PE premium {pe_premium_change}%, Score {pe_score}, VWAP {current_vwap}"
+        )
+        return "BUY PE", context.get("next_otm_pe_symbol"), context.get("next_otm_pe_token"), trigger
+
+    return None, None, None, None
+
+
+def update_gamma_trade_trailing(trade, current_price):
+    entry_price = float(trade["entry_price"])
+    current_price = float(current_price)
+
+    highest_price = float(trade.get("highest_price", entry_price))
+    if current_price > highest_price:
+        trade["highest_price"] = round(current_price, 2)
+        save_active_trades()
+
+    hard_sl = round(entry_price * (1 - GAMMA_OPTION_HARD_SL_PERCENT / 100), 2)
+    return hard_sl
+
+
+def check_gamma_exit(trade, current_price, nifty, context, now):
+    if current_price is None:
+        return None, None
+
+    current_price = float(current_price)
+    hard_sl = update_gamma_trade_trailing(trade, current_price)
+    entry_price = float(trade["entry_price"])
+    highest_price = float(trade.get("highest_price", entry_price))
+
+    if gamma_force_exit_time(now):
+        return "GAMMA TIME EXIT", f"Force exit after {GAMMA_FORCE_EXIT_HOUR}:{GAMMA_FORCE_EXIT_MINUTE:02d}"
+
+    if current_price <= hard_sl:
+        return "GAMMA HARD SL HIT", f"Premium {round(current_price,2)} <= SL {hard_sl}"
+
+    if highest_price > entry_price:
+        fall_from_high = percent_change(current_price, highest_price)
+        if fall_from_high <= -GAMMA_OPTION_PROFIT_COLLAPSE_PERCENT:
+            return "GAMMA PREMIUM COLLAPSE EXIT", f"Premium fell {fall_from_high}% from high {highest_price}"
+
+    # Trail using each completed 1-minute NIFTY candle low/high.
+    if len(nifty_candles) >= 1:
+        prev = nifty_candles[-1]
+        if trade["trade_type"] == "BUY CE":
+            prev_low = float(prev["low"])
+            if float(nifty) < prev_low:
+                return "GAMMA PREVIOUS CANDLE LOW EXIT", f"NIFTY {round(float(nifty),2)} < Previous candle low {round(prev_low,2)}"
+        elif trade["trade_type"] == "BUY PE":
+            prev_high = float(prev["high"])
+            if float(nifty) > prev_high:
+                return "GAMMA PREVIOUS CANDLE HIGH EXIT", f"NIFTY {round(float(nifty),2)} > Previous candle high {round(prev_high,2)}"
+
+    # OI reversal exit: after CE buy, if Call OI starts increasing again, writers are returning.
+    option_by_token = context.get("option_by_token", {})
+    atm_ce = option_by_token.get(context.get("atm_ce_token"), {})
+    atm_pe = option_by_token.get(context.get("atm_pe_token"), {})
+
+    entry_ce_oi = float(trade.get("entry_atm_ce_oi", 0) or 0)
+    entry_pe_oi = float(trade.get("entry_atm_pe_oi", 0) or 0)
+    current_ce_oi = float(atm_ce.get("oi", 0) or 0)
+    current_pe_oi = float(atm_pe.get("oi", 0) or 0)
+
+    if trade["trade_type"] == "BUY CE" and entry_ce_oi > 0:
+        ce_oi_from_entry = percent_change(current_ce_oi, entry_ce_oi)
+        if ce_oi_from_entry >= GAMMA_OI_REVERSAL_PERCENT:
+            return "GAMMA CE OI REVERSAL EXIT", f"Call OI increased {ce_oi_from_entry}% from entry"
+
+    if trade["trade_type"] == "BUY PE" and entry_pe_oi > 0:
+        pe_oi_from_entry = percent_change(current_pe_oi, entry_pe_oi)
+        if pe_oi_from_entry >= GAMMA_OI_REVERSAL_PERCENT:
+            return "GAMMA PE OI REVERSAL EXIT", f"Put OI increased {pe_oi_from_entry}% from entry"
+
+    return None, None
+
 
 # ==========================================================
 # EXIT LOGIC FOR ALL STRATEGIES
 # ==========================================================
-def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, sample_due):
+def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, sample_due, context=None):
     global pcr_ce_decrease_count, pcr_pe_increase_count
 
-    current_price = call_price if trade["trade_type"] == "BUY CE" else put_price
+    # Use the actual trade symbol for exit price.
+    # This is essential because Strategy-7 GAMMA_BLAST buys NEXT OTM, not ATM.
+    current_price = safe_ltp("NFO", trade["symbol"], trade["token"])
+    if current_price is None:
+        current_price = call_price if trade["trade_type"] == "BUY CE" else put_price
     if current_price is None:
         return False
 
@@ -1491,8 +1846,13 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
     exit_reason = None
     exit_trigger = None
 
+    # Gamma Blast has expiry-specific OTM trailing and OI reversal exit.
+    if strategy_name == GAMMA_BLAST_NAME:
+        gamma_context = context if context is not None else {}
+        exit_reason, exit_trigger = check_gamma_exit(trade, current_price, nifty, gamma_context, ist_now())
+
     # ADX has separate percentage based exit, so PCR and SMC remain unchanged.
-    if strategy_name == "ADX":
+    elif strategy_name == "ADX":
         exit_reason, exit_trigger = check_adx_exit(trade, current_price, nifty)
 
     # Strategy-6 Supertrend + EMA has separate percentage trailing exit.
@@ -1600,6 +1960,11 @@ def create_trade(strategy_name, trade_type, symbol, token, price, time_str, nift
         trade["trailing_sl_price"] = round(price * (1 - SUPER_EMA_OPTION_SL_PERCENT / 100), 2)
         trade["trailing_profit_percent"] = 0
 
+    if strategy_name == GAMMA_BLAST_NAME:
+        trade["quantity"] = GAMMA_BLAST_QTY
+        trade["highest_price"] = round(price, 2)
+        trade["trailing_sl_price"] = round(price * (1 - GAMMA_OPTION_HARD_SL_PERCENT / 100), 2)
+
     return trade
 
 
@@ -1672,6 +2037,10 @@ while True:
         atm_ce_token = context["atm_ce_token"]
         atm_pe_symbol = context["atm_pe_symbol"]
         atm_pe_token = context["atm_pe_token"]
+        next_otm_ce_symbol = context["next_otm_ce_symbol"]
+        next_otm_ce_token = context["next_otm_ce_token"]
+        next_otm_pe_symbol = context["next_otm_pe_symbol"]
+        next_otm_pe_token = context["next_otm_pe_token"]
 
         # 3-minute PCR sample change
         sample_due = False
@@ -1740,12 +2109,30 @@ while True:
         else:
             print("SUPER_EMA: collecting candles")
 
+        if GAMMA_BLAST_ENABLED:
+            gamma_status = "ON" if is_gamma_expiry_day(now, context) and gamma_entry_time_ok(now) else "WAIT"
+            print(
+                "GAMMA_BLAST:",
+                gamma_status,
+                "| Expiry:", context.get("expiry"),
+                "| Next OTM CE:", context.get("next_otm_ce_symbol"),
+                "| Next OTM PE:", context.get("next_otm_pe_symbol"),
+                "| Qty:", GAMMA_BLAST_QTY
+            )
+
         call_price = None
         put_price = None
         if atm_ce_symbol and atm_ce_token:
             call_price = safe_ltp("NFO", atm_ce_symbol, atm_ce_token)
         if atm_pe_symbol and atm_pe_token:
             put_price = safe_ltp("NFO", atm_pe_symbol, atm_pe_token)
+
+        otm_call_price = None
+        otm_put_price = None
+        if next_otm_ce_symbol and next_otm_ce_token:
+            otm_call_price = safe_ltp("NFO", next_otm_ce_symbol, next_otm_ce_token)
+        if next_otm_pe_symbol and next_otm_pe_token:
+            otm_put_price = safe_ltp("NFO", next_otm_pe_symbol, next_otm_pe_token)
 
         # ==================================================
         # LIVE MARKET TRADING
@@ -1757,7 +2144,7 @@ while True:
             for strategy_name, trade in list(open_trades.items()):
                 exited = check_exit_for_trade(
                     strategy_name, trade, call_price, put_price, time_str,
-                    nifty, pcr, atm_pcr, max_pain, pcr_change_3min, sample_due
+                    nifty, pcr, atm_pcr, max_pain, pcr_change_3min, sample_due, context
                 )
                 if exited:
                     exited_strategies.add(strategy_name)
@@ -1892,6 +2279,44 @@ while True:
                     )
                     enter_trade(SUPER_EMA_NAME, trade)
                     last_super_ema_entry_time = now
+
+
+            # 8) Strategy-7 Gamma Blast Expiry entry
+            if (
+                GAMMA_BLAST_NAME not in open_trades
+                and GAMMA_BLAST_NAME not in exited_strategies
+                and gamma_cooldown_ok(now)
+            ):
+                gamma_signal, gamma_symbol, gamma_token, gamma_trigger = get_gamma_signal(
+                    context, nifty, otm_call_price, otm_put_price, now
+                )
+
+                if gamma_signal == "BUY CE" and gamma_symbol and gamma_token and otm_call_price is not None:
+                    trade = create_trade(
+                        GAMMA_BLAST_NAME, "BUY CE", gamma_symbol, gamma_token, otm_call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, gamma_trigger
+                    )
+                    option_by_token = context.get("option_by_token", {})
+                    trade["entry_atm_ce_oi"] = option_by_token.get(context.get("atm_ce_token"), {}).get("oi", 0)
+                    trade["entry_atm_pe_oi"] = option_by_token.get(context.get("atm_pe_token"), {}).get("oi", 0)
+                    trade["entry_otm_ce_oi"] = option_by_token.get(context.get("next_otm_ce_token"), {}).get("oi", 0)
+                    enter_trade(GAMMA_BLAST_NAME, trade)
+                    last_gamma_entry_time = now
+
+                elif gamma_signal == "BUY PE" and gamma_symbol and gamma_token and otm_put_price is not None:
+                    trade = create_trade(
+                        GAMMA_BLAST_NAME, "BUY PE", gamma_symbol, gamma_token, otm_put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, gamma_trigger
+                    )
+                    option_by_token = context.get("option_by_token", {})
+                    trade["entry_atm_ce_oi"] = option_by_token.get(context.get("atm_ce_token"), {}).get("oi", 0)
+                    trade["entry_atm_pe_oi"] = option_by_token.get(context.get("atm_pe_token"), {}).get("oi", 0)
+                    trade["entry_otm_pe_oi"] = option_by_token.get(context.get("next_otm_pe_token"), {}).get("oi", 0)
+                    enter_trade(GAMMA_BLAST_NAME, trade)
+                    last_gamma_entry_time = now
+
+            # Update Gamma comparison snapshot after all entry logic.
+            update_gamma_snapshot(context, nifty, otm_call_price, otm_put_price)
 
         # ==================================================
         # FORCE EXIT AFTER MARKET FOR ALL OPEN TRADES
