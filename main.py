@@ -95,6 +95,16 @@ RSI_STOCH_ENTRY_START_MINUTE = 20
 RSI_STOCH_ENTRY_END_HOUR = 15
 RSI_STOCH_ENTRY_END_MINUTE = 15
 
+# Market Structure Strategy settings - Strategy 5
+# Pure independent Market Structure logic based on MSB / ZigZag / Fib confirmation.
+MARKET_STRUCTURE_ENABLED = True
+MARKET_STRUCTURE_NAME = "MARKET_STRUCTURE"
+MS_ZIGZAG_LENGTH = 9
+MS_FIB_FACTOR = 0.273
+MS_MIN_CANDLES_REQUIRED = 30
+MS_COOLDOWN_SECONDS = 900       # 15 minutes after one Market Structure entry
+MS_MIN_BODY_POINTS = 3          # candle body confirmation for breakout candle
+
 # PCR sample variables
 last_pcr_sample_time = None
 sample_pcr = None
@@ -113,6 +123,10 @@ session_price_count = 0
 last_vwap = None
 current_vwap = None
 last_smc_entry_time = None
+
+# Market Structure variables
+last_market_structure_entry_time = None
+last_market_structure_signal_key = None
 
 # ==========================================================
 # CSV / GOOGLE SHEET HEADERS
@@ -370,7 +384,7 @@ def login():
 
         if data and data.get("status"):
             print("LOGIN SUCCESS")
-            send_telegram("🌅 4 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
+            send_telegram("🌅 5 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
             return True
 
         print("LOGIN FAILED:", data)
@@ -516,6 +530,135 @@ def get_smc_signal(nifty):
         trigger = (
             f"SMC BUY PE: Bearish BOS below swing low {round(swing_low,2)}, "
             f"NIFTY {round(candle_close,2)} below VWAP {current_vwap}, VWAP falling"
+        )
+        return "BUY PE", trigger
+
+    return None, None
+
+# ==========================================================
+# MARKET STRUCTURE STRATEGY HELPERS - STRATEGY 5
+# ==========================================================
+def market_structure_cooldown_ok(now):
+    if last_market_structure_entry_time is None:
+        return True
+    try:
+        return (now - last_market_structure_entry_time).total_seconds() >= MS_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+
+def find_market_structure_swings(candles, zigzag_len=9):
+    """
+    Non-repaint swing detection.
+    A swing high/low is confirmed only after zigzag_len candles are available on both sides.
+    This is safer for paper/live automation than using a future-looking visual signal.
+    """
+    highs = []
+    lows = []
+
+    if candles is None or len(candles) < (zigzag_len * 2 + 3):
+        return highs, lows
+
+    for i in range(zigzag_len, len(candles) - zigzag_len):
+        window = candles[i - zigzag_len:i + zigzag_len + 1]
+        high = float(candles[i]["high"])
+        low = float(candles[i]["low"])
+        max_high = max(float(c["high"]) for c in window)
+        min_low = min(float(c["low"]) for c in window)
+
+        if high == max_high:
+            highs.append({"index": i, "price": high, "minute": candles[i].get("minute", "")})
+        if low == min_low:
+            lows.append({"index": i, "price": low, "minute": candles[i].get("minute", "")})
+
+    return highs, lows
+
+
+def get_market_structure_state():
+    """Return latest Market Structure reference levels for printing/debugging."""
+    candles = get_all_working_candles()
+    if len(candles) < MS_MIN_CANDLES_REQUIRED:
+        return None
+
+    completed = list(nifty_candles)
+    highs, lows = find_market_structure_swings(completed, MS_ZIGZAG_LENGTH)
+    if not highs or not lows:
+        return None
+
+    last_high = highs[-1]
+    last_low = lows[-1]
+    structure_range = abs(float(last_high["price"]) - float(last_low["price"]))
+    fib_points = round(structure_range * MS_FIB_FACTOR, 2)
+
+    return {
+        "last_swing_high": round(float(last_high["price"]), 2),
+        "last_swing_low": round(float(last_low["price"]), 2),
+        "fib_points": fib_points,
+        "high_minute": last_high.get("minute", ""),
+        "low_minute": last_low.get("minute", "")
+    }
+
+
+def get_market_structure_signal(nifty):
+    """
+    Strategy-5 Pure Market Structure:
+    BUY CE: Current candle closes above latest confirmed swing high + Fib confirmation distance.
+    BUY PE: Current candle closes below latest confirmed swing low - Fib confirmation distance.
+
+    This does NOT use PCR, VWAP, RSI, Stochastic, EMA or ADX.
+    """
+    global last_market_structure_signal_key
+
+    if not MARKET_STRUCTURE_ENABLED:
+        return None, None
+
+    if current_candle is None or len(nifty_candles) < MS_MIN_CANDLES_REQUIRED:
+        return None, None
+
+    completed = list(nifty_candles)
+    highs, lows = find_market_structure_swings(completed, MS_ZIGZAG_LENGTH)
+    if not highs or not lows:
+        return None, None
+
+    last_high = highs[-1]
+    last_low = lows[-1]
+    swing_high = float(last_high["price"])
+    swing_low = float(last_low["price"])
+    structure_range = abs(swing_high - swing_low)
+
+    if structure_range <= 0:
+        return None, None
+
+    fib_points = structure_range * MS_FIB_FACTOR
+    bullish_break_level = swing_high + fib_points
+    bearish_break_level = swing_low - fib_points
+
+    candle_open = float(current_candle["open"])
+    candle_close = float(nifty)
+    candle_body = abs(candle_close - candle_open)
+
+    bullish_body = candle_close > candle_open and candle_body >= MS_MIN_BODY_POINTS
+    bearish_body = candle_close < candle_open and candle_body >= MS_MIN_BODY_POINTS
+
+    # Prevent repeated signal on the same structural level after restart/loops.
+    bullish_key = f"CE_{last_high['index']}_{round(swing_high, 2)}"
+    bearish_key = f"PE_{last_low['index']}_{round(swing_low, 2)}"
+
+    if candle_close >= bullish_break_level and bullish_body and last_market_structure_signal_key != bullish_key:
+        last_market_structure_signal_key = bullish_key
+        trigger = (
+            f"MARKET_STRUCTURE BUY CE: MSB above swing high {round(swing_high, 2)} "
+            f"with Fib {MS_FIB_FACTOR} confirmation {round(fib_points, 2)} points, "
+            f"break level {round(bullish_break_level, 2)}, NIFTY {round(candle_close, 2)}"
+        )
+        return "BUY CE", trigger
+
+    if candle_close <= bearish_break_level and bearish_body and last_market_structure_signal_key != bearish_key:
+        last_market_structure_signal_key = bearish_key
+        trigger = (
+            f"MARKET_STRUCTURE BUY PE: MSB below swing low {round(swing_low, 2)} "
+            f"with Fib {MS_FIB_FACTOR} confirmation {round(fib_points, 2)} points, "
+            f"break level {round(bearish_break_level, 2)}, NIFTY {round(candle_close, 2)}"
         )
         return "BUY PE", trigger
 
@@ -1289,6 +1432,17 @@ while True:
         else:
             print("RSI_STOCH_EMA: collecting candles")
 
+        ms_state = get_market_structure_state()
+        if ms_state:
+            print(
+                "MARKET_STRUCTURE:",
+                "Swing High", ms_state["last_swing_high"],
+                "Swing Low", ms_state["last_swing_low"],
+                "Fib Points", ms_state["fib_points"]
+            )
+        else:
+            print("MARKET_STRUCTURE: collecting candles")
+
         call_price = None
         put_price = None
         if atm_ce_symbol and atm_ce_token:
@@ -1401,6 +1555,26 @@ while True:
                         nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, rsi_stoch_trigger
                     )
                     enter_trade(RSI_STOCH_EMA_NAME, trade)
+
+            # 6) Strategy-5 Pure Market Structure entry
+            if MARKET_STRUCTURE_NAME not in open_trades and MARKET_STRUCTURE_NAME not in exited_strategies and market_structure_cooldown_ok(now):
+                ms_signal, ms_trigger = get_market_structure_signal(nifty)
+
+                if ms_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        MARKET_STRUCTURE_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, ms_trigger
+                    )
+                    enter_trade(MARKET_STRUCTURE_NAME, trade)
+                    last_market_structure_entry_time = now
+
+                elif ms_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        MARKET_STRUCTURE_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, ms_trigger
+                    )
+                    enter_trade(MARKET_STRUCTURE_NAME, trade)
+                    last_market_structure_entry_time = now
 
         # ==================================================
         # FORCE EXIT AFTER MARKET FOR ALL OPEN TRADES
