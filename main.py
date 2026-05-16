@@ -31,7 +31,7 @@ google_sheet = None
 last_heartbeat_hour = -1
 
 # Multiple active trades will be stored here
-# Example: open_trades["PCR"] = {...}, open_trades["SMC"] = {...}
+# Example: open_trades["PCR"] = {...}, open_trades["SMC"] = {...}, open_trades["ADX"] = {...}
 open_trades = {}
 
 PAPER_FILE = "paper_trades.csv"
@@ -60,6 +60,17 @@ SMC_VWAP_SLOPE_POINTS = 1.5         # VWAP direction filter
 SMC_MIN_CANDLES_REQUIRED = 8
 SMC_COOLDOWN_SECONDS = 900          # 15 minutes after one SMC entry
 SMC_BODY_MIN_POINTS = 3             # candle body confirmation
+
+# ADX Strategy settings
+ADX_ENABLED = True
+ADX_PERIOD = 14
+ADX_MIN_VALUE = 25
+ADX_MIN_CANDLES_REQUIRED = 30
+ADX_STOPLOSS_PERCENT = 20          # option premium stop loss
+ADX_TARGET_PERCENT = 35            # option premium target
+ADX_BREAKEVEN_PERCENT = 15         # after this profit, SL moves to cost
+ADX_VWAP_FILTER = True
+ADX_FALL_EXIT_CANDLES = 2          # exit if ADX falls for 2 candles
 
 # PCR sample variables
 last_pcr_sample_time = None
@@ -487,6 +498,208 @@ def get_smc_signal(nifty):
     return None, None
 
 # ==========================================================
+# ADX STRATEGY HELPERS
+# ==========================================================
+def get_all_working_candles():
+    """Return completed candles plus current running candle."""
+    candles = list(nifty_candles)
+    if current_candle is not None:
+        candles.append(current_candle)
+    return candles
+
+
+def calculate_adx_values(candles, period=14):
+    """
+    Calculate ADX, +DI and -DI using Wilder smoothing.
+    Returns a list of dictionaries. Last item is the latest ADX state.
+    """
+    if candles is None or len(candles) < (period * 2 + 2):
+        return []
+
+    tr_list = []
+    plus_dm_list = []
+    minus_dm_list = []
+
+    for i in range(1, len(candles)):
+        high = float(candles[i]["high"])
+        low = float(candles[i]["low"])
+        prev_high = float(candles[i - 1]["high"])
+        prev_low = float(candles[i - 1]["low"])
+        prev_close = float(candles[i - 1]["close"])
+
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        up_move = high - prev_high
+        down_move = prev_low - low
+
+        plus_dm = up_move if up_move > down_move and up_move > 0 else 0.0
+        minus_dm = down_move if down_move > up_move and down_move > 0 else 0.0
+
+        tr_list.append(tr)
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
+
+    if len(tr_list) < period:
+        return []
+
+    smoothed_tr = sum(tr_list[:period])
+    smoothed_plus_dm = sum(plus_dm_list[:period])
+    smoothed_minus_dm = sum(minus_dm_list[:period])
+
+    dx_values = []
+    output = []
+
+    for i in range(period, len(tr_list)):
+        smoothed_tr = smoothed_tr - (smoothed_tr / period) + tr_list[i]
+        smoothed_plus_dm = smoothed_plus_dm - (smoothed_plus_dm / period) + plus_dm_list[i]
+        smoothed_minus_dm = smoothed_minus_dm - (smoothed_minus_dm / period) + minus_dm_list[i]
+
+        if smoothed_tr == 0:
+            plus_di = 0.0
+            minus_di = 0.0
+        else:
+            plus_di = 100 * (smoothed_plus_dm / smoothed_tr)
+            minus_di = 100 * (smoothed_minus_dm / smoothed_tr)
+
+        di_sum = plus_di + minus_di
+        dx = 0.0 if di_sum == 0 else 100 * abs(plus_di - minus_di) / di_sum
+        dx_values.append(dx)
+
+        if len(dx_values) < period:
+            continue
+        elif len(dx_values) == period:
+            adx = sum(dx_values) / period
+        else:
+            prev_adx = output[-1]["adx"]
+            adx = ((prev_adx * (period - 1)) + dx) / period
+
+        output.append({
+            "adx": round(adx, 2),
+            "plus_di": round(plus_di, 2),
+            "minus_di": round(minus_di, 2),
+            "close": float(candles[i + 1]["close"]) if (i + 1) < len(candles) else float(candles[-1]["close"]),
+        })
+
+    return output
+
+
+def get_latest_adx_state():
+    candles = get_all_working_candles()
+    if len(candles) < ADX_MIN_CANDLES_REQUIRED:
+        return None
+    values = calculate_adx_values(candles, ADX_PERIOD)
+    if not values:
+        return None
+    return values[-1]
+
+
+def is_adx_falling(values, count=2):
+    if values is None or len(values) < count + 1:
+        return False
+    recent = values[-(count + 1):]
+    for i in range(1, len(recent)):
+        if recent[i]["adx"] >= recent[i - 1]["adx"]:
+            return False
+    return True
+
+
+def get_adx_signal(nifty):
+    """
+    Strategy-3 ADX:
+    BUY CE: ADX strong + +DI above -DI + NIFTY above VWAP.
+    BUY PE: ADX strong + -DI above +DI + NIFTY below VWAP.
+    """
+    if not ADX_ENABLED:
+        return None, None
+
+    candles = get_all_working_candles()
+    if len(candles) < ADX_MIN_CANDLES_REQUIRED:
+        return None, None
+
+    values = calculate_adx_values(candles, ADX_PERIOD)
+    if not values:
+        return None, None
+
+    latest = values[-1]
+    adx = latest["adx"]
+    plus_di = latest["plus_di"]
+    minus_di = latest["minus_di"]
+
+    if adx < ADX_MIN_VALUE:
+        return None, None
+
+    if ADX_VWAP_FILTER and current_vwap is None:
+        return None, None
+
+    above_vwap = True if not ADX_VWAP_FILTER else float(nifty) > float(current_vwap)
+    below_vwap = True if not ADX_VWAP_FILTER else float(nifty) < float(current_vwap)
+
+    if plus_di > minus_di and above_vwap:
+        trigger = (
+            f"ADX BUY CE: ADX {adx} > {ADX_MIN_VALUE}, +DI {plus_di} > -DI {minus_di}, "
+            f"NIFTY {round(float(nifty), 2)} above VWAP {current_vwap}"
+        )
+        return "BUY CE", trigger
+
+    if minus_di > plus_di and below_vwap:
+        trigger = (
+            f"ADX BUY PE: ADX {adx} > {ADX_MIN_VALUE}, -DI {minus_di} > +DI {plus_di}, "
+            f"NIFTY {round(float(nifty), 2)} below VWAP {current_vwap}"
+        )
+        return "BUY PE", trigger
+
+    return None, None
+
+
+def check_adx_exit(trade, current_price, nifty):
+    """Return (exit_reason, exit_trigger) for ADX strategy only."""
+    if current_price is None:
+        return None, None
+
+    entry_price = float(trade["entry_price"])
+    profit_percent = round(((float(current_price) - entry_price) / entry_price) * 100, 2)
+
+    if profit_percent <= -ADX_STOPLOSS_PERCENT:
+        return "ADX STOPLOSS HIT", f"OPTION LOSS {profit_percent}%"
+
+    if profit_percent >= ADX_TARGET_PERCENT:
+        return "ADX TARGET HIT", f"OPTION PROFIT {profit_percent}%"
+
+    if profit_percent >= ADX_BREAKEVEN_PERCENT and not trade.get("breakeven_active"):
+        trade["breakeven_active"] = True
+        trade["breakeven_price"] = entry_price
+        save_active_trades()
+
+    if trade.get("breakeven_active") and float(current_price) <= float(trade.get("breakeven_price", entry_price)):
+        return "ADX BREAKEVEN EXIT", f"PROFIT LOCKED THEN BACK TO ENTRY, CURRENT PROFIT {profit_percent}%"
+
+    candles = get_all_working_candles()
+    values = calculate_adx_values(candles, ADX_PERIOD)
+    if not values:
+        return None, None
+
+    latest = values[-1]
+    adx = latest["adx"]
+    plus_di = latest["plus_di"]
+    minus_di = latest["minus_di"]
+
+    if trade["trade_type"] == "BUY CE":
+        if plus_di < minus_di:
+            return "ADX CE DI REVERSAL EXIT", f"+DI {plus_di} < -DI {minus_di}"
+        if current_vwap is not None and float(nifty) < float(current_vwap):
+            return "ADX CE VWAP EXIT", f"NIFTY {round(float(nifty), 2)} below VWAP {current_vwap}"
+
+    elif trade["trade_type"] == "BUY PE":
+        if minus_di < plus_di:
+            return "ADX PE DI REVERSAL EXIT", f"-DI {minus_di} < +DI {plus_di}"
+        if current_vwap is not None and float(nifty) > float(current_vwap):
+            return "ADX PE VWAP EXIT", f"NIFTY {round(float(nifty), 2)} above VWAP {current_vwap}"
+
+    if is_adx_falling(values, ADX_FALL_EXIT_CANDLES):
+        return "ADX WEAKENING EXIT", f"ADX falling for {ADX_FALL_EXIT_CANDLES} candles, latest ADX {adx}"
+
+    return None, None
+
+# ==========================================================
 # OPTION MASTER HELPERS
 # ==========================================================
 def load_symbol_master():
@@ -622,8 +835,12 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
     exit_reason = None
     exit_trigger = None
 
-    # Common SL / Target for both PCR and SMC
-    if points <= -STOPLOSS_POINTS:
+    # ADX has separate percentage based exit, so PCR and SMC remain unchanged.
+    if strategy_name == "ADX":
+        exit_reason, exit_trigger = check_adx_exit(trade, current_price, nifty)
+
+    # Common SL / Target for PCR and SMC
+    elif points <= -STOPLOSS_POINTS:
         exit_reason = "STOPLOSS HIT"
         exit_trigger = f"OPTION POINTS {points}"
     elif points >= TARGET_POINTS:
@@ -806,6 +1023,11 @@ while True:
         print("3 Min PCR Change:", pcr_change_3min, "| 3 Min ATM PCR Change:", atm_pcr_change_3min)
         print("Max Pain:", max_pain)
         print("VWAP Approx:", current_vwap, "| Open Trades:", list(open_trades.keys()))
+        adx_state = get_latest_adx_state()
+        if adx_state:
+            print("ADX:", adx_state["adx"], "| +DI:", adx_state["plus_di"], "| -DI:", adx_state["minus_di"])
+        else:
+            print("ADX: collecting candles")
 
         call_price = None
         put_price = None
@@ -883,6 +1105,24 @@ while True:
                     )
                     enter_trade("SMC", trade)
                     last_smc_entry_time = now
+
+            # 4) Strategy-3 ADX entry
+            if "ADX" not in open_trades and "ADX" not in exited_strategies:
+                adx_signal, adx_trigger = get_adx_signal(nifty)
+
+                if adx_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        "ADX", "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, adx_trigger
+                    )
+                    enter_trade("ADX", trade)
+
+                elif adx_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        "ADX", "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, adx_trigger
+                    )
+                    enter_trade("ADX", trade)
 
         # ==================================================
         # FORCE EXIT AFTER MARKET FOR ALL OPEN TRADES
