@@ -105,6 +105,26 @@ MS_MIN_CANDLES_REQUIRED = 30
 MS_COOLDOWN_SECONDS = 900       # 15 minutes after one Market Structure entry
 MS_MIN_BODY_POINTS = 3          # candle body confirmation for breakout candle
 
+# Supertrend + EMA Crossover Strategy settings - Strategy 6
+SUPER_EMA_ENABLED = True
+SUPER_EMA_NAME = "SUPER_EMA"
+SUPER_EMA_FAST_PERIOD = 5
+SUPER_EMA_SLOW_PERIOD = 20
+SUPER_EMA_ATR_PERIOD = 10
+SUPER_EMA_ATR_MULTIPLIER = 3
+SUPER_EMA_MIN_CANDLES_REQUIRED = 35
+SUPER_EMA_COOLDOWN_SECONDS = 600       # 10 minutes after one entry
+SUPER_EMA_ADX_FILTER = True
+SUPER_EMA_MIN_ADX = 20
+SUPER_EMA_OPTION_SL_PERCENT = 20       # initial option premium stoploss
+SUPER_EMA_BREAKEVEN_PERCENT = 10       # move SL to entry after +10%
+SUPER_EMA_LOCK1_PERCENT = 20           # after +20% profit
+SUPER_EMA_LOCK1_SL_PERCENT = 10        # lock +10% profit
+SUPER_EMA_LOCK2_PERCENT = 30           # after +30% profit
+SUPER_EMA_LOCK2_SL_PERCENT = 20        # lock +20% profit
+SUPER_EMA_TRAIL_START_PERCENT = 50     # after +50%, trail from highest premium
+SUPER_EMA_TRAIL_GAP_PERCENT = 10       # trailing SL gap from highest premium
+
 # PCR sample variables
 last_pcr_sample_time = None
 sample_pcr = None
@@ -127,6 +147,10 @@ last_smc_entry_time = None
 # Market Structure variables
 last_market_structure_entry_time = None
 last_market_structure_signal_key = None
+
+# Supertrend + EMA variables
+last_super_ema_entry_time = None
+last_super_ema_signal_key = None
 
 # ==========================================================
 # CSV / GOOGLE SHEET HEADERS
@@ -384,7 +408,7 @@ def login():
 
         if data and data.get("status"):
             print("LOGIN SUCCESS")
-            send_telegram("🌅 5 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
+            send_telegram("🌅 6 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
             return True
 
         print("LOGIN FAILED:", data)
@@ -1081,6 +1105,256 @@ def check_rsi_stoch_ema_exit(trade, nifty):
 
     return None, None
 
+
+# ==========================================================
+# SUPERTREND + EMA CROSSOVER HELPERS - STRATEGY 6
+# ==========================================================
+def super_ema_cooldown_ok(now):
+    if last_super_ema_entry_time is None:
+        return True
+    try:
+        return (now - last_super_ema_entry_time).total_seconds() >= SUPER_EMA_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+
+def calculate_supertrend_values(candles, atr_period=10, multiplier=3):
+    """
+    Calculate Supertrend from NIFTY candles.
+    Direction GREEN means close is above Supertrend line.
+    Direction RED means close is below Supertrend line.
+    """
+    if candles is None or len(candles) < atr_period + 2:
+        return []
+
+    trs = []
+    for i in range(len(candles)):
+        high = float(candles[i]["high"])
+        low = float(candles[i]["low"])
+        if i == 0:
+            tr = high - low
+        else:
+            prev_close = float(candles[i - 1]["close"])
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+
+    atrs = [None] * len(candles)
+    first_atr = sum(trs[1:atr_period + 1]) / atr_period
+    atrs[atr_period] = first_atr
+    for i in range(atr_period + 1, len(candles)):
+        atrs[i] = ((atrs[i - 1] * (atr_period - 1)) + trs[i]) / atr_period
+
+    output = []
+    final_upper = None
+    final_lower = None
+    supertrend = None
+    direction = None
+
+    for i in range(atr_period, len(candles)):
+        high = float(candles[i]["high"])
+        low = float(candles[i]["low"])
+        close = float(candles[i]["close"])
+        prev_close = float(candles[i - 1]["close"]) if i > 0 else close
+        atr = atrs[i]
+        if atr is None:
+            continue
+
+        hl2 = (high + low) / 2
+        basic_upper = hl2 + (multiplier * atr)
+        basic_lower = hl2 - (multiplier * atr)
+
+        if final_upper is None:
+            final_upper = basic_upper
+            final_lower = basic_lower
+        else:
+            final_upper = basic_upper if (basic_upper < final_upper or prev_close > final_upper) else final_upper
+            final_lower = basic_lower if (basic_lower > final_lower or prev_close < final_lower) else final_lower
+
+        if supertrend is None:
+            if close >= final_lower:
+                supertrend = final_lower
+                direction = "GREEN"
+            else:
+                supertrend = final_upper
+                direction = "RED"
+        elif supertrend == final_upper:
+            if close <= final_upper:
+                supertrend = final_upper
+                direction = "RED"
+            else:
+                supertrend = final_lower
+                direction = "GREEN"
+        else:
+            if close >= final_lower:
+                supertrend = final_lower
+                direction = "GREEN"
+            else:
+                supertrend = final_upper
+                direction = "RED"
+
+        output.append({
+            "supertrend": round(supertrend, 2),
+            "direction": direction,
+            "atr": round(atr, 2),
+            "close": round(close, 2)
+        })
+
+    return output
+
+
+def get_latest_super_ema_state():
+    candles = get_all_working_candles()
+    if len(candles) < SUPER_EMA_MIN_CANDLES_REQUIRED:
+        return None
+
+    closes = [float(c["close"]) for c in candles]
+    ema_fast = calculate_ema_series(closes, SUPER_EMA_FAST_PERIOD)
+    ema_slow = calculate_ema_series(closes, SUPER_EMA_SLOW_PERIOD)
+    st_values = calculate_supertrend_values(
+        candles,
+        SUPER_EMA_ATR_PERIOD,
+        SUPER_EMA_ATR_MULTIPLIER
+    )
+
+    if len(ema_fast) < 2 or len(ema_slow) < 2 or len(st_values) < 2:
+        return None
+
+    return {
+        "ema_fast": round(ema_fast[-1], 2),
+        "ema_slow": round(ema_slow[-1], 2),
+        "prev_ema_fast": round(ema_fast[-2], 2),
+        "prev_ema_slow": round(ema_slow[-2], 2),
+        "supertrend": st_values[-1]["supertrend"],
+        "supertrend_direction": st_values[-1]["direction"],
+        "prev_supertrend_direction": st_values[-2]["direction"],
+        "close": round(closes[-1], 2)
+    }
+
+
+def get_super_ema_signal(nifty):
+    """
+    Strategy-6 Supertrend + EMA Crossover:
+    BUY CE: EMA5 crosses above EMA20 and Supertrend is GREEN.
+    BUY PE: EMA5 crosses below EMA20 and Supertrend is RED.
+    Optional ADX filter avoids sideways-market fake signals.
+    """
+    global last_super_ema_signal_key
+
+    if not SUPER_EMA_ENABLED:
+        return None, None
+
+    state = get_latest_super_ema_state()
+    if state is None:
+        return None, None
+
+    if SUPER_EMA_ADX_FILTER:
+        adx_state = get_latest_adx_state()
+        if adx_state is None or float(adx_state.get("adx", 0)) < SUPER_EMA_MIN_ADX:
+            return None, None
+
+    price = float(nifty)
+    ema_fast = state["ema_fast"]
+    ema_slow = state["ema_slow"]
+    prev_fast = state["prev_ema_fast"]
+    prev_slow = state["prev_ema_slow"]
+    st = state["supertrend"]
+    st_dir = state["supertrend_direction"]
+
+    bullish_cross = prev_fast <= prev_slow and ema_fast > ema_slow
+    bearish_cross = prev_fast >= prev_slow and ema_fast < ema_slow
+
+    signal_key = f"{current_candle.get('minute', '')}_{round(ema_fast, 2)}_{round(ema_slow, 2)}_{st_dir}"
+
+    if bullish_cross and st_dir == "GREEN" and price > ema_fast and price > ema_slow and price > st:
+        key = "CE_" + signal_key
+        if last_super_ema_signal_key == key:
+            return None, None
+        last_super_ema_signal_key = key
+        trigger = (
+            f"SUPER_EMA BUY CE: EMA{SUPER_EMA_FAST_PERIOD} {ema_fast} crossed above "
+            f"EMA{SUPER_EMA_SLOW_PERIOD} {ema_slow}, Supertrend GREEN {st}, NIFTY {round(price, 2)}"
+        )
+        return "BUY CE", trigger
+
+    if bearish_cross and st_dir == "RED" and price < ema_fast and price < ema_slow and price < st:
+        key = "PE_" + signal_key
+        if last_super_ema_signal_key == key:
+            return None, None
+        last_super_ema_signal_key = key
+        trigger = (
+            f"SUPER_EMA BUY PE: EMA{SUPER_EMA_FAST_PERIOD} {ema_fast} crossed below "
+            f"EMA{SUPER_EMA_SLOW_PERIOD} {ema_slow}, Supertrend RED {st}, NIFTY {round(price, 2)}"
+        )
+        return "BUY PE", trigger
+
+    return None, None
+
+
+def update_super_ema_trailing_sl(trade, current_price):
+    """Update option-premium based trailing SL for Strategy-6."""
+    entry_price = float(trade["entry_price"])
+    current_price = float(current_price)
+    profit_percent = round(((current_price - entry_price) / entry_price) * 100, 2)
+
+    highest_price = float(trade.get("highest_price", entry_price))
+    if current_price > highest_price:
+        highest_price = current_price
+        trade["highest_price"] = round(highest_price, 2)
+
+    current_sl = float(trade.get("trailing_sl_price", entry_price * (1 - SUPER_EMA_OPTION_SL_PERCENT / 100)))
+    new_sl = current_sl
+
+    if profit_percent >= SUPER_EMA_BREAKEVEN_PERCENT:
+        new_sl = max(new_sl, entry_price)
+    if profit_percent >= SUPER_EMA_LOCK1_PERCENT:
+        new_sl = max(new_sl, entry_price * (1 + SUPER_EMA_LOCK1_SL_PERCENT / 100))
+    if profit_percent >= SUPER_EMA_LOCK2_PERCENT:
+        new_sl = max(new_sl, entry_price * (1 + SUPER_EMA_LOCK2_SL_PERCENT / 100))
+    if profit_percent >= SUPER_EMA_TRAIL_START_PERCENT:
+        new_sl = max(new_sl, highest_price * (1 - SUPER_EMA_TRAIL_GAP_PERCENT / 100))
+
+    new_sl = round(new_sl, 2)
+    if new_sl != round(current_sl, 2):
+        trade["trailing_sl_price"] = new_sl
+        trade["trailing_profit_percent"] = profit_percent
+        save_active_trades()
+
+    return profit_percent, new_sl
+
+
+def check_super_ema_exit(trade, current_price, nifty):
+    if current_price is None:
+        return None, None
+
+    profit_percent, trailing_sl = update_super_ema_trailing_sl(trade, current_price)
+
+    if float(current_price) <= float(trailing_sl):
+        return "SUPER_EMA TRAILING SL HIT", f"Option {round(float(current_price),2)} <= Trail SL {trailing_sl}, P/L {profit_percent}%"
+
+    state = get_latest_super_ema_state()
+    if state is None:
+        return None, None
+
+    ema_fast = state["ema_fast"]
+    ema_slow = state["ema_slow"]
+    st = state["supertrend"]
+    st_dir = state["supertrend_direction"]
+    price = float(nifty)
+
+    if trade["trade_type"] == "BUY CE":
+        if ema_fast < ema_slow:
+            return "SUPER_EMA CE EMA REVERSAL EXIT", f"EMA{SUPER_EMA_FAST_PERIOD} {ema_fast} below EMA{SUPER_EMA_SLOW_PERIOD} {ema_slow}"
+        if st_dir == "RED" or price < st:
+            return "SUPER_EMA CE SUPERTREND EXIT", f"Supertrend {st_dir}, ST {st}, NIFTY {round(price,2)}"
+
+    elif trade["trade_type"] == "BUY PE":
+        if ema_fast > ema_slow:
+            return "SUPER_EMA PE EMA REVERSAL EXIT", f"EMA{SUPER_EMA_FAST_PERIOD} {ema_fast} above EMA{SUPER_EMA_SLOW_PERIOD} {ema_slow}"
+        if st_dir == "GREEN" or price > st:
+            return "SUPER_EMA PE SUPERTREND EXIT", f"Supertrend {st_dir}, ST {st}, NIFTY {round(price,2)}"
+
+    return None, None
+
 # ==========================================================
 # OPTION MASTER HELPERS
 # ==========================================================
@@ -1221,6 +1495,10 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
     if strategy_name == "ADX":
         exit_reason, exit_trigger = check_adx_exit(trade, current_price, nifty)
 
+    # Strategy-6 Supertrend + EMA has separate percentage trailing exit.
+    elif strategy_name == SUPER_EMA_NAME:
+        exit_reason, exit_trigger = check_super_ema_exit(trade, current_price, nifty)
+
     # Common SL / Target for PCR and SMC
     elif points <= -STOPLOSS_POINTS:
         exit_reason = "STOPLOSS HIT"
@@ -1298,7 +1576,7 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
 # ENTRY HELPERS
 # ==========================================================
 def create_trade(strategy_name, trade_type, symbol, token, price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change, atm_pcr_change, entry_trigger):
-    return {
+    trade = {
         "trade_id": generate_trade_id(strategy_name),
         "strategy_name": strategy_name,
         "entry_time": time_str,
@@ -1316,6 +1594,13 @@ def create_trade(strategy_name, trade_type, symbol, token, price, time_str, nift
         "vwap_entry": current_vwap if current_vwap is not None else "",
         "entry_trigger": entry_trigger
     }
+
+    if strategy_name == SUPER_EMA_NAME:
+        trade["highest_price"] = round(price, 2)
+        trade["trailing_sl_price"] = round(price * (1 - SUPER_EMA_OPTION_SL_PERCENT / 100), 2)
+        trade["trailing_profit_percent"] = 0
+
+    return trade
 
 
 def enter_trade(strategy_name, trade):
@@ -1442,6 +1727,18 @@ while True:
             )
         else:
             print("MARKET_STRUCTURE: collecting candles")
+
+        super_ema_state = get_latest_super_ema_state()
+        if super_ema_state:
+            print(
+                "SUPER_EMA:",
+                "EMA5", super_ema_state["ema_fast"],
+                "EMA20", super_ema_state["ema_slow"],
+                "ST", super_ema_state["supertrend"],
+                "DIR", super_ema_state["supertrend_direction"]
+            )
+        else:
+            print("SUPER_EMA: collecting candles")
 
         call_price = None
         put_price = None
@@ -1575,6 +1872,26 @@ while True:
                     )
                     enter_trade(MARKET_STRUCTURE_NAME, trade)
                     last_market_structure_entry_time = now
+
+            # 7) Strategy-6 Supertrend + EMA Crossover entry
+            if SUPER_EMA_NAME not in open_trades and SUPER_EMA_NAME not in exited_strategies and super_ema_cooldown_ok(now):
+                super_signal, super_trigger = get_super_ema_signal(nifty)
+
+                if super_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        SUPER_EMA_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, super_trigger
+                    )
+                    enter_trade(SUPER_EMA_NAME, trade)
+                    last_super_ema_entry_time = now
+
+                elif super_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        SUPER_EMA_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, super_trigger
+                    )
+                    enter_trade(SUPER_EMA_NAME, trade)
+                    last_super_ema_entry_time = now
 
         # ==================================================
         # FORCE EXIT AFTER MARKET FOR ALL OPEN TRADES
