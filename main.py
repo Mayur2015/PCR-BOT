@@ -29,12 +29,25 @@ smartApi = None
 google_sheet = None
 last_heartbeat_hour = -1
 
+# ==========================================================
+# PCR ML DATA COLLECTION GLOBALS
+# ==========================================================
+pcr_ml_sheet = None
+last_pcr_ml_save_minute = None
+last_pcr_ml_alert_hour = -1
+previous_pcr_ml_snapshot = None
+pcr_ml_snapshots = []
+india_vix_token = None
+india_vix_symbol = None
+last_preopen_login_date = None
+
 # Multiple active trades will be stored here
 # Example: open_trades["PCR"] = {...}, open_trades["SMC"] = {...}, open_trades["ADX"] = {...}
 open_trades = {}
 
 PAPER_FILE = "paper_trades.csv"
 ACTIVE_TRADES_FILE = "active_trades.json"
+PCR_ML_FILE = "pcr_ml_history.csv"
 
 # ==========================================================
 # STRATEGY SETTINGS
@@ -191,6 +204,24 @@ HEADERS = [
     "Entry Trigger", "Exit Trigger", "Trade Duration Min"
 ]
 
+
+# ==========================================================
+# PCR ML GOOGLE SHEET / CSV HEADERS
+# ==========================================================
+PCR_ML_HEADERS = [
+    "TIME", "NIFTY", "INDIA_VIX", "VIX_CHANGE",
+    "PCR_OI", "PCR_VOLUME", "ATM_PCR",
+    "TOTAL_CE_OI", "TOTAL_PE_OI", "CE_OI_CHANGE", "PE_OI_CHANGE", "OI_DIFFERENCE",
+    "CE_VOLUME", "PE_VOLUME", "CE_VOLUME_CHANGE", "PE_VOLUME_CHANGE", "VOLUME_DELTA",
+    "MAX_PAIN", "DISTANCE_MAX_PAIN",
+    "MAX_CE_OI_STRIKE", "MAX_PE_OI_STRIKE", "CE_STRIKE_SHIFT", "PE_STRIKE_SHIFT",
+    "VWAP", "VWAP_DISTANCE",
+    "DAYS_TO_EXPIRY", "TIME_BLOCK", "MARKET_DIRECTION",
+    "NIFTY_CHANGE_1MIN", "NIFTY_CHANGE_5MIN", "NIFTY_CHANGE_15MIN",
+    "FUTURE_MOVE_15MIN", "FUTURE_MOVE_30MIN", "FUTURE_MOVE_60MIN",
+    "ML_SIGNAL", "CREATED_AT"
+]
+
 # ==========================================================
 # BASIC HELPERS
 # ==========================================================
@@ -266,7 +297,21 @@ def init_google_sheet():
         ]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
-        google_sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        google_sheet = spreadsheet.sheet1
+
+        # Separate tab for PCR Machine Learning data
+        global pcr_ml_sheet
+        try:
+            pcr_ml_sheet = spreadsheet.worksheet("PCR_ML_DATA")
+        except Exception:
+            pcr_ml_sheet = spreadsheet.add_worksheet(
+                title="PCR_ML_DATA",
+                rows="50000",
+                cols=str(len(PCR_ML_HEADERS) + 5)
+            )
+            pcr_ml_sheet.append_row(PCR_ML_HEADERS, value_input_option="USER_ENTERED")
+
         print("GOOGLE SHEET CONNECTED")
         send_telegram("✅ GOOGLE SHEET CONNECTED SUCCESSFULLY")
         return True
@@ -288,6 +333,304 @@ def init_paper_file():
     except Exception as e:
         print("Paper File Init Error:", e)
         log_error(str(e))
+
+
+# ==========================================================
+# PCR ML DATA COLLECTION HELPERS - SEPARATE MODULE
+# ==========================================================
+def init_pcr_ml_file():
+    """
+    Separate CSV database for PCR ML analysis.
+    This does not disturb paper trade file or strategy logic.
+    """
+    global previous_pcr_ml_snapshot
+    try:
+        if not os.path.exists(PCR_ML_FILE):
+            with open(PCR_ML_FILE, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(PCR_ML_HEADERS)
+            previous_pcr_ml_snapshot = None
+            return
+
+        # Load last row after restart so delta calculation can continue.
+        with open(PCR_ML_FILE, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+            if rows:
+                previous_pcr_ml_snapshot = rows[-1]
+    except Exception as e:
+        print("PCR ML File Init Error:", e)
+        log_error(str(e))
+
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def parse_expiry_for_ml(expiry_text):
+    try:
+        return datetime.strptime(expiry_text, "%d%b%Y").date()
+    except Exception:
+        return None
+
+
+def get_time_block(now):
+    total_min = now.hour * 60 + now.minute
+    if total_min < 9 * 60 + 45:
+        return "OPENING"
+    elif total_min < 11 * 60:
+        return "MORNING"
+    elif total_min < 13 * 60:
+        return "MIDDAY"
+    elif total_min < 14 * 60 + 30:
+        return "AFTERNOON"
+    elif total_min <= 15 * 60 + 30:
+        return "CLOSING"
+    return "OUT_OF_MARKET"
+
+
+def get_india_vix_from_symbols(symbols):
+    """
+    Finds India VIX token from Angel symbol master and fetches LTP.
+    If token is not found, returns 0 without disturbing the main bot.
+    """
+    global india_vix_token, india_vix_symbol
+
+    try:
+        if india_vix_token is None:
+            for s in symbols:
+                name = str(s.get("name", "")).upper()
+                symbol = str(s.get("symbol", "")).upper()
+                exch = str(s.get("exch_seg", "")).upper()
+
+                if exch == "NSE" and ("INDIA VIX" in name or "INDIAVIX" in name or "INDIA VIX" in symbol or "INDIAVIX" in symbol):
+                    india_vix_token = s.get("token")
+                    india_vix_symbol = s.get("symbol") or s.get("name") or "INDIA VIX"
+                    print("INDIA VIX FOUND:", india_vix_symbol, india_vix_token)
+                    break
+
+        if india_vix_token:
+            vix = safe_ltp("NSE", india_vix_symbol, india_vix_token)
+            return round(vix, 2) if vix is not None else 0
+
+    except Exception as e:
+        print("India VIX Fetch Error:", e)
+        log_error(str(e))
+
+    return 0
+
+
+def get_snapshot_nifty_change(minutes_back, current_nifty):
+    """
+    Approximate change using stored 1-minute PCR ML snapshots.
+    """
+    try:
+        if len(pcr_ml_snapshots) <= minutes_back:
+            return 0
+        old = pcr_ml_snapshots[-minutes_back]
+        return round(float(current_nifty) - float(old.get("NIFTY", current_nifty)), 2)
+    except Exception:
+        return 0
+
+
+def get_market_direction(nifty_change_1min, nifty_change_5min, nifty_change_15min):
+    if nifty_change_15min > 30:
+        return "STRONG_UP"
+    if nifty_change_15min < -30:
+        return "STRONG_DOWN"
+    if nifty_change_5min > 15:
+        return "UP"
+    if nifty_change_5min < -15:
+        return "DOWN"
+    if abs(nifty_change_1min) <= 5:
+        return "SIDEWAYS"
+    return "MIXED"
+
+
+def build_pcr_ml_snapshot(symbols, context, nifty, now):
+    previous = previous_pcr_ml_snapshot or {}
+
+    option_by_token = context.get("option_by_token", {})
+    strike_agg = {}
+
+    total_ce_oi = 0
+    total_pe_oi = 0
+    total_ce_volume = 0
+    total_pe_volume = 0
+
+    for _, opt in option_by_token.items():
+        strike = int(opt.get("strike", 0) or 0)
+        opt_type = opt.get("type", "")
+        oi = int(opt.get("oi", 0) or 0)
+        volume = int(opt.get("volume", 0) or 0)
+
+        if strike not in strike_agg:
+            strike_agg[strike] = {"CE_OI": 0, "PE_OI": 0, "CE_VOLUME": 0, "PE_VOLUME": 0}
+
+        if opt_type == "CE":
+            total_ce_oi += oi
+            total_ce_volume += volume
+            strike_agg[strike]["CE_OI"] += oi
+            strike_agg[strike]["CE_VOLUME"] += volume
+        elif opt_type == "PE":
+            total_pe_oi += oi
+            total_pe_volume += volume
+            strike_agg[strike]["PE_OI"] += oi
+            strike_agg[strike]["PE_VOLUME"] += volume
+
+    pcr_oi = round(total_pe_oi / total_ce_oi, 4) if total_ce_oi else 0
+    pcr_volume = round(total_pe_volume / total_ce_volume, 4) if total_ce_volume else 0
+
+    max_ce_oi_strike = 0
+    max_pe_oi_strike = 0
+    if strike_agg:
+        max_ce_oi_strike = max(strike_agg, key=lambda k: strike_agg[k]["CE_OI"])
+        max_pe_oi_strike = max(strike_agg, key=lambda k: strike_agg[k]["PE_OI"])
+
+    india_vix = get_india_vix_from_symbols(symbols)
+
+    prev_vix = safe_float(previous.get("INDIA_VIX", 0))
+    prev_ce_oi = safe_float(previous.get("TOTAL_CE_OI", 0))
+    prev_pe_oi = safe_float(previous.get("TOTAL_PE_OI", 0))
+    prev_ce_volume = safe_float(previous.get("CE_VOLUME", 0))
+    prev_pe_volume = safe_float(previous.get("PE_VOLUME", 0))
+    prev_ce_strike = safe_float(previous.get("MAX_CE_OI_STRIKE", 0))
+    prev_pe_strike = safe_float(previous.get("MAX_PE_OI_STRIKE", 0))
+
+    vix_change = round(india_vix - prev_vix, 2) if prev_vix else 0
+    ce_oi_change = round(total_ce_oi - prev_ce_oi, 2) if prev_ce_oi else 0
+    pe_oi_change = round(total_pe_oi - prev_pe_oi, 2) if prev_pe_oi else 0
+    ce_volume_change = round(total_ce_volume - prev_ce_volume, 2) if prev_ce_volume else 0
+    pe_volume_change = round(total_pe_volume - prev_pe_volume, 2) if prev_pe_volume else 0
+
+    max_pain = context.get("max_pain", 0) or 0
+    distance_max_pain = round(float(nifty) - float(max_pain), 2) if max_pain else 0
+    vwap_distance = round(float(nifty) - float(current_vwap), 2) if current_vwap is not None else 0
+
+    expiry_date = parse_expiry_for_ml(context.get("expiry", ""))
+    days_to_expiry = (expiry_date - now.date()).days if expiry_date else ""
+
+    nifty_change_1min = get_snapshot_nifty_change(1, nifty)
+    nifty_change_5min = get_snapshot_nifty_change(5, nifty)
+    nifty_change_15min = get_snapshot_nifty_change(15, nifty)
+    market_direction = get_market_direction(nifty_change_1min, nifty_change_5min, nifty_change_15min)
+
+    # Basic placeholder ML signal. Actual trained ML model will replace this after enough history.
+    if pcr_oi > 1.2 and pe_oi_change > ce_oi_change and vix_change <= 0:
+        ml_signal = "BULLISH_BIAS"
+    elif pcr_oi < 0.8 and ce_oi_change > pe_oi_change and vix_change >= 0:
+        ml_signal = "BEARISH_BIAS"
+    else:
+        ml_signal = "DATA_COLLECTION"
+
+    return {
+        "TIME": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "NIFTY": round(float(nifty), 2),
+        "INDIA_VIX": india_vix,
+        "VIX_CHANGE": vix_change,
+        "PCR_OI": pcr_oi,
+        "PCR_VOLUME": pcr_volume,
+        "ATM_PCR": round(float(context.get("atm_pcr", 0) or 0), 4),
+        "TOTAL_CE_OI": total_ce_oi,
+        "TOTAL_PE_OI": total_pe_oi,
+        "CE_OI_CHANGE": ce_oi_change,
+        "PE_OI_CHANGE": pe_oi_change,
+        "OI_DIFFERENCE": total_pe_oi - total_ce_oi,
+        "CE_VOLUME": total_ce_volume,
+        "PE_VOLUME": total_pe_volume,
+        "CE_VOLUME_CHANGE": ce_volume_change,
+        "PE_VOLUME_CHANGE": pe_volume_change,
+        "VOLUME_DELTA": total_pe_volume - total_ce_volume,
+        "MAX_PAIN": max_pain,
+        "DISTANCE_MAX_PAIN": distance_max_pain,
+        "MAX_CE_OI_STRIKE": max_ce_oi_strike,
+        "MAX_PE_OI_STRIKE": max_pe_oi_strike,
+        "CE_STRIKE_SHIFT": int(max_ce_oi_strike - prev_ce_strike) if prev_ce_strike else 0,
+        "PE_STRIKE_SHIFT": int(max_pe_oi_strike - prev_pe_strike) if prev_pe_strike else 0,
+        "VWAP": current_vwap if current_vwap is not None else "",
+        "VWAP_DISTANCE": vwap_distance,
+        "DAYS_TO_EXPIRY": days_to_expiry,
+        "TIME_BLOCK": get_time_block(now),
+        "MARKET_DIRECTION": market_direction,
+        "NIFTY_CHANGE_1MIN": nifty_change_1min,
+        "NIFTY_CHANGE_5MIN": nifty_change_5min,
+        "NIFTY_CHANGE_15MIN": nifty_change_15min,
+        "FUTURE_MOVE_15MIN": "",
+        "FUTURE_MOVE_30MIN": "",
+        "FUTURE_MOVE_60MIN": "",
+        "ML_SIGNAL": ml_signal,
+        "CREATED_AT": ist_now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+
+def save_pcr_ml_snapshot(symbols, context, nifty, now):
+    """
+    Saves one PCR ML row per minute during live market.
+    Sends Telegram only every 2 hours.
+    """
+    global last_pcr_ml_save_minute, last_pcr_ml_alert_hour, previous_pcr_ml_snapshot, pcr_ml_snapshots
+
+    try:
+        minute_key = now.strftime("%Y-%m-%d %H:%M")
+        if last_pcr_ml_save_minute == minute_key:
+            return
+
+        snapshot = build_pcr_ml_snapshot(symbols, context, nifty, now)
+        row = [snapshot.get(h, "") for h in PCR_ML_HEADERS]
+
+        # Save CSV
+        file_exists = os.path.exists(PCR_ML_FILE)
+        with open(PCR_ML_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(PCR_ML_HEADERS)
+            writer.writerow(row)
+
+        # Save Google Sheet tab
+        if pcr_ml_sheet is not None:
+            pcr_ml_sheet.append_row(row, value_input_option="USER_ENTERED")
+        else:
+            print("PCR_ML_DATA sheet not connected")
+
+        previous_pcr_ml_snapshot = snapshot
+        pcr_ml_snapshots.append(snapshot)
+        if len(pcr_ml_snapshots) > 500:
+            pcr_ml_snapshots = pcr_ml_snapshots[-500:]
+
+        last_pcr_ml_save_minute = minute_key
+
+        print(
+            "PCR ML SNAPSHOT SAVED |",
+            snapshot["TIME"],
+            "| NIFTY:", snapshot["NIFTY"],
+            "| PCR:", snapshot["PCR_OI"],
+            "| ATM PCR:", snapshot["ATM_PCR"],
+            "| VIX:", snapshot["INDIA_VIX"],
+            "| MAX PAIN:", snapshot["MAX_PAIN"]
+        )
+
+        # Telegram health alert every 2 hours only
+        if now.hour % 2 == 0 and last_pcr_ml_alert_hour != now.hour:
+            send_telegram(
+                "📊 PCR ML DATA RECORDING ACTIVE\n"
+                f"Time: {snapshot['TIME']}\n"
+                f"NIFTY: {snapshot['NIFTY']}\n"
+                f"India VIX: {snapshot['INDIA_VIX']} | Change: {snapshot['VIX_CHANGE']}\n"
+                f"PCR OI: {snapshot['PCR_OI']} | ATM PCR: {snapshot['ATM_PCR']}\n"
+                f"Max Pain: {snapshot['MAX_PAIN']} | Distance: {snapshot['DISTANCE_MAX_PAIN']}\n"
+                f"Market Direction: {snapshot['MARKET_DIRECTION']}\n"
+                f"ML Status: {snapshot['ML_SIGNAL']}"
+            )
+            last_pcr_ml_alert_hour = now.hour
+
+    except Exception as e:
+        print("PCR ML Snapshot Save Error:", e)
+        log_error(str(e))
+        send_telegram(f"❌ PCR ML SNAPSHOT ERROR\n{e}")
 
 # ==========================================================
 # ACTIVE TRADE RECOVERY
@@ -1991,6 +2334,7 @@ def enter_trade(strategy_name, trade):
 # START BOT
 # ==========================================================
 init_paper_file()
+init_pcr_ml_file()
 init_google_sheet()
 load_active_trades()
 
@@ -2009,6 +2353,19 @@ while True:
         now = ist_now()
         time_str = now.strftime("%Y-%m-%d %H:%M:%S")
         mode = market_mode(now)
+
+        # Sleep during closed market if there are no open paper trades.
+        # Pre-open relogin at/after 08:45 helps prepare session before market.
+        global_last_preopen_login_date = globals().get("last_preopen_login_date")
+        if mode in ["AFTER MARKET", "WEEKEND"] and not open_trades:
+            if mode == "AFTER MARKET" and now.hour == 8 and now.minute >= 45 and global_last_preopen_login_date != now.date().isoformat():
+                if login():
+                    globals()["last_preopen_login_date"] = now.date().isoformat()
+                    send_telegram(f"🔐 PRE-MARKET AUTO LOGIN DONE\nTime: {time_str}")
+            sleep_time = 1800 if mode == "WEEKEND" else 300
+            print(f"{mode} - No open trades. Sleeping {sleep_time} seconds.")
+            time.sleep(sleep_time)
+            continue
 
         # Heartbeat every 2 hours
         if now.hour % 2 == 0 and last_heartbeat_hour != now.hour:
@@ -2132,6 +2489,12 @@ while True:
             otm_call_price = safe_ltp("NFO", next_otm_ce_symbol, next_otm_ce_token)
         if next_otm_pe_symbol and next_otm_pe_token:
             otm_put_price = safe_ltp("NFO", next_otm_pe_symbol, next_otm_pe_token)
+
+        # ==================================================
+        # PCR ML DATA COLLECTION - SEPARATE SILENT MODULE
+        # ==================================================
+        if mode == "LIVE MARKET":
+            save_pcr_ml_snapshot(symbols, context, nifty, now)
 
         # ==================================================
         # LIVE MARKET TRADING
