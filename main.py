@@ -1740,12 +1740,14 @@ def load_symbol_master():
 
 def get_option_context(symbols, now, nifty):
     opts = [
-        s for s in symbols
-        if s.get("exch_seg") == "NFO"
-        and "NIFTY" in s.get("symbol", "")
-        and (s.get("symbol", "").endswith("CE") or s.get("symbol", "").endswith("PE"))
-    ]
-
+    s for s in symbols
+    if s.get("exch_seg") == "NFO"
+    and s.get("name", "") == "NIFTY"
+    and (
+        s.get("symbol", "").endswith("CE")
+        or s.get("symbol", "").endswith("PE")
+    )
+]
     expiries = list(set([o["expiry"] for o in opts]))
     exp_list = []
     today = now.date()
