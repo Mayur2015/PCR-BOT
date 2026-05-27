@@ -216,7 +216,9 @@ PCR_ML_HEADERS = [
     "MAX_PAIN", "DISTANCE_MAX_PAIN",
     "MAX_CE_OI_STRIKE", "MAX_PE_OI_STRIKE", "CE_STRIKE_SHIFT", "PE_STRIKE_SHIFT",
     "VWAP", "VWAP_DISTANCE",
-    "DAYS_TO_EXPIRY", "TIME_BLOCK", "MARKET_DIRECTION",
+    "DAYS_TO_EXPIRY",
+    "IS_EXPIRY_DAY", "IS_PRE_EXPIRY_DAY", "IS_POST_EXPIRY_DAY", "EXPIRY_TYPE",
+    "TIME_BLOCK", "MARKET_DIRECTION",
     "NIFTY_CHANGE_1MIN", "NIFTY_CHANGE_5MIN", "NIFTY_CHANGE_15MIN",
     "FUTURE_MOVE_15MIN", "FUTURE_MOVE_30MIN", "FUTURE_MOVE_60MIN",
     "ML_SIGNAL", "CREATED_AT"
@@ -304,6 +306,17 @@ def init_google_sheet():
         global pcr_ml_sheet
         try:
             pcr_ml_sheet = spreadsheet.worksheet("PCR_ML_DATA")
+
+            # Keep PCR_ML_DATA header updated when new ML columns are added.
+            # This is safe for old data: old rows remain as-is, new columns are added in header.
+            try:
+                existing_header = pcr_ml_sheet.row_values(1)
+                if existing_header != PCR_ML_HEADERS:
+                    pcr_ml_sheet.update("A1", [PCR_ML_HEADERS], value_input_option="USER_ENTERED")
+                    print("PCR_ML_DATA header updated with latest ML columns")
+            except Exception as header_error:
+                print("PCR_ML_DATA header update warning:", header_error)
+
         except Exception:
             pcr_ml_sheet = spreadsheet.add_worksheet(
                 title="PCR_ML_DATA",
@@ -342,25 +355,55 @@ def init_pcr_ml_file():
     """
     Separate CSV database for PCR ML analysis.
     This does not disturb paper trade file or strategy logic.
+
+    If new ML columns are added later, this function safely upgrades
+    the existing CSV header and keeps old rows usable.
     """
     global previous_pcr_ml_snapshot
     try:
         if not os.path.exists(PCR_ML_FILE):
             with open(PCR_ML_FILE, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(PCR_ML_HEADERS)
+                writer = csv.DictWriter(f, fieldnames=PCR_ML_HEADERS)
+                writer.writeheader()
             previous_pcr_ml_snapshot = None
             return
+
+        # Safe CSV header migration for added columns.
+        with open(PCR_ML_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            old_fieldnames = reader.fieldnames or []
+            rows = list(reader)
+
+        if old_fieldnames != PCR_ML_HEADERS:
+            backup_file = PCR_ML_FILE.replace(".csv", "_backup_before_header_update.csv")
+            try:
+                if not os.path.exists(backup_file):
+                    with open(backup_file, "w", newline="") as bf:
+                        backup_writer = csv.DictWriter(bf, fieldnames=old_fieldnames)
+                        backup_writer.writeheader()
+                        backup_writer.writerows(rows)
+            except Exception as backup_error:
+                print("PCR ML backup warning:", backup_error)
+
+            with open(PCR_ML_FILE, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=PCR_ML_HEADERS)
+                writer.writeheader()
+                for r in rows:
+                    writer.writerow({h: r.get(h, "") for h in PCR_ML_HEADERS})
+
+            print("PCR ML CSV header updated safely")
 
         # Load last row after restart so delta calculation can continue.
         with open(PCR_ML_FILE, "r", newline="") as f:
             rows = list(csv.DictReader(f))
             if rows:
                 previous_pcr_ml_snapshot = rows[-1]
+            else:
+                previous_pcr_ml_snapshot = None
+
     except Exception as e:
         print("PCR ML File Init Error:", e)
         log_error(str(e))
-
 
 def safe_float(value, default=0.0):
     try:
@@ -391,6 +434,31 @@ def get_time_block(now):
     elif total_min <= 15 * 60 + 30:
         return "CLOSING"
     return "OUT_OF_MARKET"
+
+
+def get_expiry_features(expiry_date, now):
+    """
+    Expiry features for PCR ML data.
+    Safe addition: does not change PCR/OI/VWAP logic.
+    """
+    try:
+        if expiry_date is None:
+            return 0, 0, 0, "UNKNOWN"
+
+        days_to_expiry = (expiry_date - now.date()).days
+
+        is_expiry_day = 1 if days_to_expiry == 0 else 0
+        is_pre_expiry_day = 1 if days_to_expiry == 1 else 0
+        is_post_expiry_day = 1 if days_to_expiry == -1 else 0
+
+        # Simple monthly expiry approximation: expiry near month-end.
+        # This is a metadata feature only; it does not affect trading logic.
+        expiry_type = "MONTHLY" if expiry_date.day >= 24 else "WEEKLY"
+
+        return is_expiry_day, is_pre_expiry_day, is_post_expiry_day, expiry_type
+
+    except Exception:
+        return 0, 0, 0, "UNKNOWN"
 
 
 def get_india_vix_from_symbols(symbols):
@@ -513,6 +581,7 @@ def build_pcr_ml_snapshot(symbols, context, nifty, now):
 
     expiry_date = parse_expiry_for_ml(context.get("expiry", ""))
     days_to_expiry = (expiry_date - now.date()).days if expiry_date else ""
+    is_expiry_day, is_pre_expiry_day, is_post_expiry_day, expiry_type = get_expiry_features(expiry_date, now)
 
     nifty_change_1min = get_snapshot_nifty_change(1, nifty)
     nifty_change_5min = get_snapshot_nifty_change(5, nifty)
@@ -554,6 +623,10 @@ def build_pcr_ml_snapshot(symbols, context, nifty, now):
         "VWAP": current_vwap if current_vwap is not None else "",
         "VWAP_DISTANCE": vwap_distance,
         "DAYS_TO_EXPIRY": days_to_expiry,
+        "IS_EXPIRY_DAY": is_expiry_day,
+        "IS_PRE_EXPIRY_DAY": is_pre_expiry_day,
+        "IS_POST_EXPIRY_DAY": is_post_expiry_day,
+        "EXPIRY_TYPE": expiry_type,
         "TIME_BLOCK": get_time_block(now),
         "MARKET_DIRECTION": market_direction,
         "NIFTY_CHANGE_1MIN": nifty_change_1min,
