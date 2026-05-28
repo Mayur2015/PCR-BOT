@@ -227,6 +227,46 @@ SL_HUNT_OPTION_SL_PERCENT = 20
 SL_HUNT_TARGET_PERCENT = 30
 SL_HUNT_BREAKEVEN_PERCENT = 12
 
+# EMA 9/20 Crossover Scalping - Strategy 9
+# Pure 3-minute EMA crossover. No VWAP, no PCR, no SL/target. Exit only on opposite crossover.
+EMA9_20_ENABLED = True
+EMA9_20_NAME = "EMA9_20_3MIN"
+EMA9_20_FAST = 9
+EMA9_20_SLOW = 20
+EMA9_20_MIN_3MIN_CANDLES = 25
+EMA9_20_COOLDOWN_SECONDS = 300
+
+# Opening Range Breakout - Strategy 10
+ORB_ENABLED = True
+ORB_NAME = "ORB_15MIN"
+ORB_RANGE_MINUTES = 15
+ORB_BUFFER_POINTS = 5
+ORB_TARGET_MULTIPLIER = 2.0
+ORB_ENTRY_END_HOUR = 12
+ORB_ENTRY_END_MINUTE = 0
+
+# Bollinger Band Mean Reversion - Strategy 11
+BOLLINGER_ENABLED = True
+BOLLINGER_NAME = "BOLLINGER_MEAN"
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD_MULTIPLIER = 2
+BOLLINGER_MIN_CANDLES = 25
+
+# MACD Histogram Squeeze - Strategy 12
+MACD_SQUEEZE_ENABLED = True
+MACD_SQUEEZE_NAME = "MACD_SQUEEZE"
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+MACD_MIN_CANDLES = 40
+
+# VWAP False Break - Strategy 13
+VWAP_FALSE_BREAK_ENABLED = True
+VWAP_FALSE_BREAK_NAME = "VWAP_FALSE_BREAK"
+VWAP_FALSE_BREAK_MIN_BODY_POINTS = 3
+VWAP_FALSE_BREAK_MIN_CANDLES = 5
+VWAP_FALSE_BREAK_COOLDOWN_SECONDS = 600
+
 # PCR sample variables
 last_pcr_sample_time = None
 sample_pcr = None
@@ -262,6 +302,16 @@ last_gamma_signal_key = None
 # Stop Loss Hunt variables
 last_sl_hunt_entry_time = None
 last_sl_hunt_signal_key = None
+
+# Strategy 9 to 13 variables
+last_ema9_20_entry_time = None
+last_ema9_20_signal_key = None
+last_orb_trade_date = None
+last_orb_signal_key = None
+last_bollinger_signal_key = None
+last_macd_signal_key = None
+last_vwap_false_break_entry_time = None
+last_vwap_false_break_signal_key = None
 
 # ==========================================================
 # CSV / GOOGLE SHEET HEADERS
@@ -1045,7 +1095,7 @@ def login():
 
         if data and data.get("status"):
             print("LOGIN SUCCESS")
-            send_telegram("🌅 8 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
+            send_telegram("🌅 13 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
             return True
 
         print("LOGIN FAILED:", data)
@@ -2963,6 +3013,396 @@ def check_sl_hunt_exit(trade, current_price, nifty):
     return None, None
 
 
+
+# ==========================================================
+# STRATEGY 9 TO 13 HELPERS
+# ==========================================================
+def aggregate_candles(base_candles, minutes=3):
+    """Aggregate 1-minute candles into N-minute candles using candle timestamp."""
+    try:
+        if not base_candles:
+            return []
+        groups = {}
+        for c in base_candles:
+            minute_text = c.get("minute", "")
+            if not minute_text:
+                continue
+            dt = datetime.strptime(minute_text, "%Y-%m-%d %H:%M")
+            bucket_minute = (dt.minute // minutes) * minutes
+            bucket_dt = dt.replace(minute=bucket_minute, second=0, microsecond=0)
+            key = bucket_dt.strftime("%Y-%m-%d %H:%M")
+            if key not in groups:
+                groups[key] = {
+                    "date": c.get("date", bucket_dt.strftime("%Y-%m-%d")),
+                    "minute": key,
+                    "open": float(c["open"]),
+                    "high": float(c["high"]),
+                    "low": float(c["low"]),
+                    "close": float(c["close"]),
+                    "vwap": c.get("vwap", "")
+                }
+            else:
+                groups[key]["high"] = max(groups[key]["high"], float(c["high"]))
+                groups[key]["low"] = min(groups[key]["low"], float(c["low"]))
+                groups[key]["close"] = float(c["close"])
+                groups[key]["vwap"] = c.get("vwap", groups[key].get("vwap", ""))
+        return [groups[k] for k in sorted(groups.keys())]
+    except Exception as e:
+        print("Aggregate Candle Error:", e)
+        log_error(str(e))
+        return []
+
+
+def ema9_20_cooldown_ok(now):
+    if last_ema9_20_entry_time is None:
+        return True
+    try:
+        return (now - last_ema9_20_entry_time).total_seconds() >= EMA9_20_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+
+def get_ema9_20_state():
+    if not EMA9_20_ENABLED:
+        return None
+    candles_3m = aggregate_candles(get_all_working_candles(), 3)
+    if len(candles_3m) < EMA9_20_MIN_3MIN_CANDLES:
+        return None
+    closes = [float(c["close"]) for c in candles_3m]
+    ema_fast = calculate_ema_series(closes, EMA9_20_FAST)
+    ema_slow = calculate_ema_series(closes, EMA9_20_SLOW)
+    if len(ema_fast) < 2 or len(ema_slow) < 2:
+        return None
+    return {
+        "ema_fast": round(ema_fast[-1], 2),
+        "ema_slow": round(ema_slow[-1], 2),
+        "prev_ema_fast": round(ema_fast[-2], 2),
+        "prev_ema_slow": round(ema_slow[-2], 2),
+        "close": round(closes[-1], 2),
+        "minute": candles_3m[-1].get("minute", "")
+    }
+
+
+def get_ema9_20_signal():
+    global last_ema9_20_signal_key
+    state = get_ema9_20_state()
+    if state is None:
+        return None, None
+    bullish_cross = state["prev_ema_fast"] <= state["prev_ema_slow"] and state["ema_fast"] > state["ema_slow"]
+    bearish_cross = state["prev_ema_fast"] >= state["prev_ema_slow"] and state["ema_fast"] < state["ema_slow"]
+    if bullish_cross:
+        key = "CE_" + state["minute"]
+        if last_ema9_20_signal_key == key:
+            return None, None
+        last_ema9_20_signal_key = key
+        return "BUY CE", f"EMA9_20_3MIN BUY CE: EMA9 {state['ema_fast']} crossed above EMA20 {state['ema_slow']} on 3-min candle {state['minute']}"
+    if bearish_cross:
+        key = "PE_" + state["minute"]
+        if last_ema9_20_signal_key == key:
+            return None, None
+        last_ema9_20_signal_key = key
+        return "BUY PE", f"EMA9_20_3MIN BUY PE: EMA9 {state['ema_fast']} crossed below EMA20 {state['ema_slow']} on 3-min candle {state['minute']}"
+    return None, None
+
+
+def check_ema9_20_exit(trade):
+    state = get_ema9_20_state()
+    if state is None:
+        return None, None
+    bullish_cross = state["prev_ema_fast"] <= state["prev_ema_slow"] and state["ema_fast"] > state["ema_slow"]
+    bearish_cross = state["prev_ema_fast"] >= state["prev_ema_slow"] and state["ema_fast"] < state["ema_slow"]
+    if trade["trade_type"] == "BUY CE" and bearish_cross:
+        return "EMA9_20 OPPOSITE CROSS EXIT", f"EMA9 {state['ema_fast']} crossed below EMA20 {state['ema_slow']} on 3-min candle"
+    if trade["trade_type"] == "BUY PE" and bullish_cross:
+        return "EMA9_20 OPPOSITE CROSS EXIT", f"EMA9 {state['ema_fast']} crossed above EMA20 {state['ema_slow']} on 3-min candle"
+    return None, None
+
+
+def get_orb_levels(now):
+    try:
+        today_text = now.strftime("%Y-%m-%d")
+        day_candles = [c for c in nifty_candles if c.get("date") == today_text and "09:15" <= c.get("minute", "")[-5:] < "09:30"]
+        if len(day_candles) < 12:
+            return None
+        high = max(float(c["high"]) for c in day_candles)
+        low = min(float(c["low"]) for c in day_candles)
+        mid = round((high + low) / 2, 2)
+        height = round(high - low, 2)
+        if height <= 0:
+            return None
+        return {"high": round(high, 2), "low": round(low, 2), "mid": mid, "height": height}
+    except Exception as e:
+        print("ORB Level Error:", e)
+        log_error(str(e))
+        return None
+
+
+def orb_entry_time_ok(now):
+    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+        return False
+    if now.hour > ORB_ENTRY_END_HOUR or (now.hour == ORB_ENTRY_END_HOUR and now.minute > ORB_ENTRY_END_MINUTE):
+        return False
+    return True
+
+
+def get_orb_signal(nifty, now):
+    global last_orb_trade_date, last_orb_signal_key
+    if not ORB_ENABLED or not orb_entry_time_ok(now):
+        return None, None, None
+    today_text = now.strftime("%Y-%m-%d")
+    if last_orb_trade_date == today_text:
+        return None, None, None
+    levels = get_orb_levels(now)
+    if not levels:
+        return None, None, None
+    price = float(nifty)
+    if price >= levels["high"] + ORB_BUFFER_POINTS:
+        key = f"CE_{today_text}_{levels['high']}"
+        if last_orb_signal_key == key:
+            return None, None, None
+        last_orb_signal_key = key
+        trigger = f"ORB BUY CE: NIFTY {round(price,2)} broke above 15-min OR high {levels['high']} + buffer {ORB_BUFFER_POINTS}. Range {levels['height']}"
+        return "BUY CE", trigger, levels
+    if price <= levels["low"] - ORB_BUFFER_POINTS:
+        key = f"PE_{today_text}_{levels['low']}"
+        if last_orb_signal_key == key:
+            return None, None, None
+        last_orb_signal_key = key
+        trigger = f"ORB BUY PE: NIFTY {round(price,2)} broke below 15-min OR low {levels['low']} - buffer {ORB_BUFFER_POINTS}. Range {levels['height']}"
+        return "BUY PE", trigger, levels
+    return None, None, None
+
+
+def check_orb_exit(trade, nifty):
+    price = float(nifty)
+    high = float(trade.get("orb_high", 0) or 0)
+    low = float(trade.get("orb_low", 0) or 0)
+    mid = float(trade.get("orb_mid", 0) or 0)
+    target = float(trade.get("orb_target", 0) or 0)
+    if not high or not low or not mid or not target:
+        return None, None
+    if trade["trade_type"] == "BUY CE":
+        if price >= target:
+            return "ORB 2X TARGET HIT", f"NIFTY {round(price,2)} reached target {target}"
+        if price <= mid:
+            return "ORB MIDPOINT STOP EXIT", f"NIFTY {round(price,2)} <= OR midpoint {mid}"
+    elif trade["trade_type"] == "BUY PE":
+        if price <= target:
+            return "ORB 2X TARGET HIT", f"NIFTY {round(price,2)} reached target {target}"
+        if price >= mid:
+            return "ORB MIDPOINT STOP EXIT", f"NIFTY {round(price,2)} >= OR midpoint {mid}"
+    return None, None
+
+
+def calculate_bollinger_state():
+    candles = get_all_working_candles()
+    if not BOLLINGER_ENABLED or len(candles) < BOLLINGER_MIN_CANDLES:
+        return None
+    closes = [float(c["close"]) for c in candles]
+    window = closes[-BOLLINGER_PERIOD:]
+    if len(window) < BOLLINGER_PERIOD:
+        return None
+    mean = sum(window) / len(window)
+    variance = sum((x - mean) ** 2 for x in window) / len(window)
+    std = variance ** 0.5
+    return {
+        "middle": round(mean, 2),
+        "upper": round(mean + BOLLINGER_STD_MULTIPLIER * std, 2),
+        "lower": round(mean - BOLLINGER_STD_MULTIPLIER * std, 2),
+        "close": closes[-1],
+        "prev_close": closes[-2] if len(closes) >= 2 else closes[-1],
+        "minute": candles[-1].get("minute", "")
+    }
+
+
+def get_bollinger_signal():
+    global last_bollinger_signal_key
+    state = calculate_bollinger_state()
+    if state is None or len(nifty_candles) < 2:
+        return None, None, None
+    prev = nifty_candles[-1]
+    current = current_candle if current_candle is not None else prev
+    price = float(current["close"])
+    # Long mean reversion: previous candle pierced lower band, current closes back inside.
+    if float(prev["low"]) < state["lower"] and price > state["lower"]:
+        key = f"CE_{state['minute']}_{state['lower']}"
+        if last_bollinger_signal_key == key:
+            return None, None, None
+        last_bollinger_signal_key = key
+        trigger = f"BOLLINGER BUY CE: Price pierced lower band {state['lower']} and closed back inside. Middle {state['middle']}"
+        return "BUY CE", trigger, {"bb_stop": round(float(prev["low"]) - 2, 2)}
+    # Short mean reversion: previous candle pierced upper band, current closes back inside.
+    if float(prev["high"]) > state["upper"] and price < state["upper"]:
+        key = f"PE_{state['minute']}_{state['upper']}"
+        if last_bollinger_signal_key == key:
+            return None, None, None
+        last_bollinger_signal_key = key
+        trigger = f"BOLLINGER BUY PE: Price pierced upper band {state['upper']} and closed back inside. Middle {state['middle']}"
+        return "BUY PE", trigger, {"bb_stop": round(float(prev["high"]) + 2, 2)}
+    return None, None, None
+
+
+def check_bollinger_exit(trade, nifty):
+    state = calculate_bollinger_state()
+    if state is None:
+        return None, None
+    price = float(nifty)
+    stop = float(trade.get("bb_stop", 0) or 0)
+    if trade["trade_type"] == "BUY CE":
+        if stop and price <= stop:
+            return "BOLLINGER STRUCTURE STOP", f"NIFTY {round(price,2)} <= stop {stop}"
+        if price >= state["middle"]:
+            return "BOLLINGER MEAN TARGET", f"NIFTY {round(price,2)} reached middle band {state['middle']}"
+    elif trade["trade_type"] == "BUY PE":
+        if stop and price >= stop:
+            return "BOLLINGER STRUCTURE STOP", f"NIFTY {round(price,2)} >= stop {stop}"
+        if price <= state["middle"]:
+            return "BOLLINGER MEAN TARGET", f"NIFTY {round(price,2)} reached middle band {state['middle']}"
+    return None, None
+
+
+def calculate_macd_histogram(closes, fast=12, slow=26, signal=9):
+    if len(closes) < slow + signal + 5:
+        return []
+    ema_fast = calculate_ema_series(closes, fast)
+    ema_slow = calculate_ema_series(closes, slow)
+    if not ema_fast or not ema_slow:
+        return []
+    offset = len(ema_fast) - len(ema_slow)
+    macd_line = [ema_fast[i + offset] - ema_slow[i] for i in range(len(ema_slow))]
+    signal_line = calculate_ema_series(macd_line, signal)
+    if not signal_line:
+        return []
+    offset2 = len(macd_line) - len(signal_line)
+    return [round(macd_line[i + offset2] - signal_line[i], 4) for i in range(len(signal_line))]
+
+
+def get_macd_squeeze_signal():
+    global last_macd_signal_key
+    if not MACD_SQUEEZE_ENABLED:
+        return None, None
+    candles = get_all_working_candles()
+    if len(candles) < MACD_MIN_CANDLES:
+        return None, None
+    closes = [float(c["close"]) for c in candles]
+    hist = calculate_macd_histogram(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    if len(hist) < 4:
+        return None, None
+    h1, h2, h3 = hist[-3], hist[-2], hist[-1]
+    minute_key = candles[-1].get("minute", "")
+    # CE: negative momentum was expanding down, then first lighter negative bar.
+    if h2 < 0 and h1 > h2 and h3 > h2:
+        key = f"CE_{minute_key}_{h3}"
+        if last_macd_signal_key == key:
+            return None, None
+        last_macd_signal_key = key
+        return "BUY CE", f"MACD_SQUEEZE BUY CE: Histogram improved from {h2} to {h3}, downward momentum slowing"
+    # PE: positive momentum was expanding up, then first fading positive bar.
+    if h2 > 0 and h1 < h2 and h3 < h2:
+        key = f"PE_{minute_key}_{h3}"
+        if last_macd_signal_key == key:
+            return None, None
+        last_macd_signal_key = key
+        return "BUY PE", f"MACD_SQUEEZE BUY PE: Histogram faded from {h2} to {h3}, upward momentum slowing"
+    return None, None
+
+
+def check_macd_squeeze_exit(trade):
+    candles = get_all_working_candles()
+    if len(candles) < MACD_MIN_CANDLES:
+        return None, None
+    closes = [float(c["close"]) for c in candles]
+    hist = calculate_macd_histogram(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    if len(hist) < 3:
+        return None, None
+    prev_h, curr_h = hist[-2], hist[-1]
+    if trade["trade_type"] == "BUY CE":
+        if curr_h > 0 and curr_h < prev_h:
+            return "MACD POSITIVE FADE EXIT", f"Histogram faded from {prev_h} to {curr_h}"
+        if curr_h < 0 and curr_h < prev_h:
+            return "MACD MOMENTUM FAILED EXIT", f"Histogram weakened from {prev_h} to {curr_h}"
+    elif trade["trade_type"] == "BUY PE":
+        if curr_h < 0 and curr_h > prev_h:
+            return "MACD NEGATIVE FADE EXIT", f"Histogram faded from {prev_h} to {curr_h}"
+        if curr_h > 0 and curr_h > prev_h:
+            return "MACD MOMENTUM FAILED EXIT", f"Histogram strengthened against PE from {prev_h} to {curr_h}"
+    return None, None
+
+
+def vwap_false_break_cooldown_ok(now):
+    if last_vwap_false_break_entry_time is None:
+        return True
+    try:
+        return (now - last_vwap_false_break_entry_time).total_seconds() >= VWAP_FALSE_BREAK_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+
+def get_session_high_low():
+    try:
+        candles = get_all_working_candles()
+        today = ist_now().strftime("%Y-%m-%d")
+        today_candles = [c for c in candles if c.get("date") == today]
+        if not today_candles:
+            return None, None
+        return max(float(c["high"]) for c in today_candles), min(float(c["low"]) for c in today_candles)
+    except Exception:
+        return None, None
+
+
+def get_vwap_false_break_signal(nifty):
+    global last_vwap_false_break_signal_key
+    if not VWAP_FALSE_BREAK_ENABLED or current_vwap is None or len(nifty_candles) < VWAP_FALSE_BREAK_MIN_CANDLES:
+        return None, None, None
+    prev = nifty_candles[-1]
+    price = float(nifty)
+    candle_open = float(current_candle.get("open", price)) if current_candle else price
+    body = abs(price - candle_open)
+    if body < VWAP_FALSE_BREAK_MIN_BODY_POINTS:
+        return None, None, None
+    minute_key = current_candle.get("minute", "") if current_candle else ""
+    session_high, session_low = get_session_high_low()
+    # False breakdown: previous closed below VWAP, current reclaimed VWAP.
+    if float(prev["close"]) < float(prev.get("vwap", current_vwap) or current_vwap) and price > float(current_vwap):
+        key = f"CE_{minute_key}_{round(current_vwap,2)}"
+        if last_vwap_false_break_signal_key == key:
+            return None, None, None
+        last_vwap_false_break_signal_key = key
+        trigger = f"VWAP_FALSE_BREAK BUY CE: Price closed below VWAP then reclaimed above VWAP {current_vwap}"
+        return "BUY CE", trigger, {"vwap_target": session_high or 0, "vwap_stop": float(prev["low"])}
+    # False breakout: previous closed above VWAP, current rejected below VWAP.
+    if float(prev["close"]) > float(prev.get("vwap", current_vwap) or current_vwap) and price < float(current_vwap):
+        key = f"PE_{minute_key}_{round(current_vwap,2)}"
+        if last_vwap_false_break_signal_key == key:
+            return None, None, None
+        last_vwap_false_break_signal_key = key
+        trigger = f"VWAP_FALSE_BREAK BUY PE: Price closed above VWAP then rejected below VWAP {current_vwap}"
+        return "BUY PE", trigger, {"vwap_target": session_low or 0, "vwap_stop": float(prev["high"])}
+    return None, None, None
+
+
+def check_vwap_false_break_exit(trade, nifty):
+    price = float(nifty)
+    target = float(trade.get("vwap_target", 0) or 0)
+    stop = float(trade.get("vwap_stop", 0) or 0)
+    if current_vwap is None:
+        return None, None
+    if trade["trade_type"] == "BUY CE":
+        if target and price >= target:
+            return "VWAP FALSE BREAK SESSION HIGH TARGET", f"NIFTY {round(price,2)} >= session high target {round(target,2)}"
+        if stop and price <= stop:
+            return "VWAP FALSE BREAK STOP", f"NIFTY {round(price,2)} <= false-break low {round(stop,2)}"
+        if price < float(current_vwap):
+            return "VWAP REJECTION EXIT", f"NIFTY {round(price,2)} back below VWAP {current_vwap}"
+    elif trade["trade_type"] == "BUY PE":
+        if target and price <= target:
+            return "VWAP FALSE BREAK SESSION LOW TARGET", f"NIFTY {round(price,2)} <= session low target {round(target,2)}"
+        if stop and price >= stop:
+            return "VWAP FALSE BREAK STOP", f"NIFTY {round(price,2)} >= false-break high {round(stop,2)}"
+        if price > float(current_vwap):
+            return "VWAP RECLAIM EXIT", f"NIFTY {round(price,2)} back above VWAP {current_vwap}"
+    return None, None
+
 # ==========================================================
 # EXIT LOGIC FOR ALL STRATEGIES
 # ==========================================================
@@ -2997,6 +3437,26 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
     # Strategy-8 Stop Loss Hunt has separate percentage protection.
     elif strategy_name == SL_HUNT_NAME:
         exit_reason, exit_trigger = check_sl_hunt_exit(trade, current_price, nifty)
+
+    # Strategy-9 EMA 9/20 3-minute exits only on opposite crossover.
+    elif strategy_name == EMA9_20_NAME:
+        exit_reason, exit_trigger = check_ema9_20_exit(trade)
+
+    # Strategy-10 ORB exits based on NIFTY range midpoint / 2X target.
+    elif strategy_name == ORB_NAME:
+        exit_reason, exit_trigger = check_orb_exit(trade, nifty)
+
+    # Strategy-11 Bollinger exits at mean or structure stop.
+    elif strategy_name == BOLLINGER_NAME:
+        exit_reason, exit_trigger = check_bollinger_exit(trade, nifty)
+
+    # Strategy-12 MACD histogram squeeze exits on histogram fade/failure.
+    elif strategy_name == MACD_SQUEEZE_NAME:
+        exit_reason, exit_trigger = check_macd_squeeze_exit(trade)
+
+    # Strategy-13 VWAP false break exits at session high/low, stop, or VWAP failure.
+    elif strategy_name == VWAP_FALSE_BREAK_NAME:
+        exit_reason, exit_trigger = check_vwap_false_break_exit(trade, nifty)
 
     # Common SL / Target for PCR and SMC
     elif points <= -STOPLOSS_POINTS:
@@ -3524,6 +3984,119 @@ while True:
                     )
                     enter_trade(SL_HUNT_NAME, trade)
                     last_sl_hunt_entry_time = now
+
+
+            # 10) Strategy-9 EMA 9/20 3-minute crossover entry
+            if entry_allowed and EMA9_20_NAME not in open_trades and EMA9_20_NAME not in exited_strategies and ema9_20_cooldown_ok(now):
+                ema_signal, ema_trigger = get_ema9_20_signal()
+
+                if ema_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        EMA9_20_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, ema_trigger
+                    )
+                    enter_trade(EMA9_20_NAME, trade)
+                    last_ema9_20_entry_time = now
+
+                elif ema_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        EMA9_20_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, ema_trigger
+                    )
+                    enter_trade(EMA9_20_NAME, trade)
+                    last_ema9_20_entry_time = now
+
+            # 11) Strategy-10 Opening Range Breakout entry
+            if entry_allowed and ORB_NAME not in open_trades and ORB_NAME not in exited_strategies:
+                orb_signal, orb_trigger, orb_levels = get_orb_signal(nifty, now)
+
+                if orb_signal == "BUY CE" and call_price is not None and orb_levels:
+                    trade = create_trade(
+                        ORB_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, orb_trigger
+                    )
+                    trade["orb_high"] = orb_levels["high"]
+                    trade["orb_low"] = orb_levels["low"]
+                    trade["orb_mid"] = orb_levels["mid"]
+                    trade["orb_target"] = round(orb_levels["high"] + (orb_levels["height"] * ORB_TARGET_MULTIPLIER), 2)
+                    enter_trade(ORB_NAME, trade)
+                    last_orb_trade_date = now.strftime("%Y-%m-%d")
+
+                elif orb_signal == "BUY PE" and put_price is not None and orb_levels:
+                    trade = create_trade(
+                        ORB_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, orb_trigger
+                    )
+                    trade["orb_high"] = orb_levels["high"]
+                    trade["orb_low"] = orb_levels["low"]
+                    trade["orb_mid"] = orb_levels["mid"]
+                    trade["orb_target"] = round(orb_levels["low"] - (orb_levels["height"] * ORB_TARGET_MULTIPLIER), 2)
+                    enter_trade(ORB_NAME, trade)
+                    last_orb_trade_date = now.strftime("%Y-%m-%d")
+
+            # 12) Strategy-11 Bollinger Band Mean Reversion entry
+            if entry_allowed and BOLLINGER_NAME not in open_trades and BOLLINGER_NAME not in exited_strategies:
+                bb_signal, bb_trigger, bb_meta = get_bollinger_signal()
+
+                if bb_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        BOLLINGER_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, bb_trigger
+                    )
+                    if bb_meta:
+                        trade.update(bb_meta)
+                    enter_trade(BOLLINGER_NAME, trade)
+
+                elif bb_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        BOLLINGER_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, bb_trigger
+                    )
+                    if bb_meta:
+                        trade.update(bb_meta)
+                    enter_trade(BOLLINGER_NAME, trade)
+
+            # 13) Strategy-12 MACD Histogram Squeeze entry
+            if entry_allowed and MACD_SQUEEZE_NAME not in open_trades and MACD_SQUEEZE_NAME not in exited_strategies:
+                macd_signal, macd_trigger = get_macd_squeeze_signal()
+
+                if macd_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        MACD_SQUEEZE_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, macd_trigger
+                    )
+                    enter_trade(MACD_SQUEEZE_NAME, trade)
+
+                elif macd_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        MACD_SQUEEZE_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, macd_trigger
+                    )
+                    enter_trade(MACD_SQUEEZE_NAME, trade)
+
+            # 14) Strategy-13 VWAP False Break entry
+            if entry_allowed and VWAP_FALSE_BREAK_NAME not in open_trades and VWAP_FALSE_BREAK_NAME not in exited_strategies and vwap_false_break_cooldown_ok(now):
+                vwap_fb_signal, vwap_fb_trigger, vwap_fb_meta = get_vwap_false_break_signal(nifty)
+
+                if vwap_fb_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        VWAP_FALSE_BREAK_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, vwap_fb_trigger
+                    )
+                    if vwap_fb_meta:
+                        trade.update(vwap_fb_meta)
+                    enter_trade(VWAP_FALSE_BREAK_NAME, trade)
+                    last_vwap_false_break_entry_time = now
+
+                elif vwap_fb_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        VWAP_FALSE_BREAK_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, vwap_fb_trigger
+                    )
+                    if vwap_fb_meta:
+                        trade.update(vwap_fb_meta)
+                    enter_trade(VWAP_FALSE_BREAK_NAME, trade)
+                    last_vwap_false_break_entry_time = now
 
             # Update Gamma comparison snapshot after all entry logic.
             update_gamma_snapshot(context, nifty, otm_call_price, otm_put_price)
