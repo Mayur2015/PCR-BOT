@@ -4,6 +4,7 @@ import time
 import csv
 import os
 import json
+import math
 from datetime import datetime
 import pytz
 import gspread
@@ -48,6 +49,28 @@ open_trades = {}
 PAPER_FILE = "paper_trades.csv"
 ACTIVE_TRADES_FILE = "active_trades.json"
 PCR_ML_FILE = "pcr_ml_history.csv"
+CANDLE_HISTORY_FILE = "nifty_candle_history.csv"
+MAX_CANDLE_HISTORY = 300
+
+# ==========================================================
+# GITHUB CANDLE HISTORY BACKUP / RESTORE
+# ==========================================================
+# Add these Railway variables:
+# GITHUB_TOKEN  = GitHub fine-grained/classic token with Contents Read & Write access
+# GITHUB_REPO   = owner/repository-name   example: MayurTank/nifty-paper-trade
+# GITHUB_BRANCH = main                  optional, default main
+# GITHUB_CANDLE_PATH = nifty_candle_history.csv optional
+# GITHUB_PCR_ML_PATH = pcr_ml_history.csv optional
+# GITHUB_SYNC_INTERVAL_MINUTES = 30 optional. Default 30 minutes to limit max data loss.
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_CANDLE_PATH = os.getenv("GITHUB_CANDLE_PATH", CANDLE_HISTORY_FILE)
+GITHUB_PCR_ML_PATH = os.getenv("GITHUB_PCR_ML_PATH", PCR_ML_FILE)
+GITHUB_SYNC_INTERVAL_MINUTES = int(os.getenv("GITHUB_SYNC_INTERVAL_MINUTES", "30"))
+GITHUB_SYNC_INTERVAL_SECONDS = GITHUB_SYNC_INTERVAL_MINUTES * 60
+last_github_candle_sync_time = None
+last_github_pcr_ml_sync_time = None
 
 # ==========================================================
 # STRATEGY SETTINGS
@@ -55,6 +78,33 @@ PCR_ML_FILE = "pcr_ml_history.csv"
 SLEEP_SECONDS = 60
 NIFTY_LOT_QTY = 65
 
+# NSE/BSE trading holidays for Equity and Equity Derivatives - 2026
+# Keep this list updated yearly as per official NSE holiday circular.
+NSE_TRADING_HOLIDAYS_2026 = {
+    "2026-01-26",  # Republic Day
+    "2026-03-03",  # Holi
+    "2026-03-26",  # Shri Ram Navami
+    "2026-03-31",  # Shri Mahavir Jayanti
+    "2026-04-03",  # Good Friday
+    "2026-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
+    "2026-05-01",  # Maharashtra Day
+    "2026-05-28",  # Bakri Id
+    "2026-06-26",  # Muharram
+    "2026-09-14",  # Ganesh Chaturthi
+    "2026-10-02",  # Mahatma Gandhi Jayanti
+    "2026-10-20",  # Dussehra
+    "2026-11-10",  # Diwali Balipratipada
+    "2026-11-24",  # Prakash Gurpurb Sri Guru Nanak Dev
+    "2026-12-25",  # Christmas
+}
+
+# Stale data / holiday safety
+STATIC_DATA_CHECK_ENABLED = True
+STATIC_DATA_MIN_SAMPLES = 5
+STATIC_DATA_MAX_NIFTY_CHANGE_POINTS = 1.0
+STATIC_DATA_MAX_OPTION_CHANGE_POINTS = 0.20
+STATIC_DATA_MAX_PCR_CHANGE = 0.001
+MARKET_DATA_SAMPLES = []
 
 # PCR Strategy settings
 PCR_SAMPLE_SECONDS = 180
@@ -160,6 +210,23 @@ GAMMA_OPTION_PROFIT_COLLAPSE_PERCENT = 18     # exit if premium falls from highe
 GAMMA_OI_REVERSAL_PERCENT = 2.0               # exit when writers come back
 GAMMA_MIN_CONFIRMATION_SCORE = 5              # OI unwinding is mandatory; score filters fake moves
 
+# Stop Loss Hunting Strategy settings - Strategy 8
+# Logic: detect stop-loss sweep/liquidity grab and reversal confirmation.
+SL_HUNT_ENABLED = True
+SL_HUNT_NAME = "SL_HUNT"
+SL_HUNT_LOOKBACK_CANDLES = 10
+SL_HUNT_SWEEP_BUFFER_POINTS = 5
+SL_HUNT_RECLAIM_BUFFER_POINTS = 2
+SL_HUNT_MIN_BODY_POINTS = 4
+SL_HUNT_MIN_WICK_RATIO = 1.2
+SL_HUNT_COOLDOWN_SECONDS = 900
+SL_HUNT_USE_VWAP_FILTER = True
+SL_HUNT_USE_PCR_FILTER = True
+SL_HUNT_MIN_CANDLES_REQUIRED = 15
+SL_HUNT_OPTION_SL_PERCENT = 20
+SL_HUNT_TARGET_PERCENT = 30
+SL_HUNT_BREAKEVEN_PERCENT = 12
+
 # PCR sample variables
 last_pcr_sample_time = None
 sample_pcr = None
@@ -192,6 +259,10 @@ last_gamma_entry_time = None
 gamma_snapshot = None
 last_gamma_signal_key = None
 
+# Stop Loss Hunt variables
+last_sl_hunt_entry_time = None
+last_sl_hunt_signal_key = None
+
 # ==========================================================
 # CSV / GOOGLE SHEET HEADERS
 # ==========================================================
@@ -220,6 +291,9 @@ PCR_ML_HEADERS = [
     "IS_EXPIRY_DAY", "IS_PRE_EXPIRY_DAY", "IS_POST_EXPIRY_DAY", "EXPIRY_TYPE",
     "TIME_BLOCK", "MARKET_DIRECTION",
     "NIFTY_CHANGE_1MIN", "NIFTY_CHANGE_5MIN", "NIFTY_CHANGE_15MIN",
+    "ATM_CE_LTP", "ATM_PE_LTP", "ATM_CE_IV", "ATM_PE_IV",
+    "ATM_CE_DELTA", "ATM_CE_GAMMA", "ATM_CE_THETA", "ATM_CE_VEGA", "ATM_CE_RHO",
+    "ATM_PE_DELTA", "ATM_PE_GAMMA", "ATM_PE_THETA", "ATM_PE_VEGA", "ATM_PE_RHO",
     "FUTURE_MOVE_15MIN", "FUTURE_MOVE_30MIN", "FUTURE_MOVE_60MIN",
     "ML_SIGNAL", "CREATED_AT"
 ]
@@ -255,9 +329,16 @@ def log_error(error_msg):
         pass
 
 
+def is_trading_holiday(now):
+    """Return True when the date is an exchange trading holiday."""
+    return now.strftime("%Y-%m-%d") in NSE_TRADING_HOLIDAYS_2026
+
+
 def market_mode(now):
     if now.weekday() >= 5:
         return "WEEKEND"
+    if is_trading_holiday(now):
+        return "HOLIDAY"
     if now.hour < 9 or now.hour > 15:
         return "AFTER MARKET"
     if now.hour == 15 and now.minute > 30:
@@ -412,6 +493,81 @@ def safe_float(value, default=0.0):
         return float(value)
     except Exception:
         return default
+
+
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def norm_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def black_scholes_price(spot, strike, time_years, rate, volatility, option_type):
+    try:
+        if spot <= 0 or strike <= 0 or time_years <= 0 or volatility <= 0:
+            return 0.0
+        d1 = (math.log(spot / strike) + (rate + 0.5 * volatility * volatility) * time_years) / (volatility * math.sqrt(time_years))
+        d2 = d1 - volatility * math.sqrt(time_years)
+        if option_type == "CE":
+            return spot * norm_cdf(d1) - strike * math.exp(-rate * time_years) * norm_cdf(d2)
+        return strike * math.exp(-rate * time_years) * norm_cdf(-d2) - spot * norm_cdf(-d1)
+    except Exception:
+        return 0.0
+
+
+def implied_volatility(option_price, spot, strike, time_years, rate, option_type):
+    try:
+        option_price = float(option_price or 0)
+        if option_price <= 0 or spot <= 0 or strike <= 0 or time_years <= 0:
+            return 0.0
+        low = 0.01
+        high = 3.00
+        for _ in range(60):
+            mid = (low + high) / 2
+            price = black_scholes_price(spot, strike, time_years, rate, mid, option_type)
+            if price > option_price:
+                high = mid
+            else:
+                low = mid
+        return round(((low + high) / 2) * 100, 2)
+    except Exception:
+        return 0.0
+
+
+def calculate_option_greeks(spot, strike, days_to_expiry, rate, iv_percent, option_type):
+    try:
+        spot = float(spot)
+        strike = float(strike)
+        time_years = max(float(days_to_expiry), 1) / 365.0
+        volatility = float(iv_percent) / 100.0
+        if spot <= 0 or strike <= 0 or volatility <= 0 or time_years <= 0:
+            return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "rho": 0}
+
+        d1 = (math.log(spot / strike) + (rate + 0.5 * volatility * volatility) * time_years) / (volatility * math.sqrt(time_years))
+        d2 = d1 - volatility * math.sqrt(time_years)
+
+        gamma = norm_pdf(d1) / (spot * volatility * math.sqrt(time_years))
+        vega = spot * norm_pdf(d1) * math.sqrt(time_years) / 100
+
+        if option_type == "CE":
+            delta = norm_cdf(d1)
+            theta = (-(spot * norm_pdf(d1) * volatility) / (2 * math.sqrt(time_years)) - rate * strike * math.exp(-rate * time_years) * norm_cdf(d2)) / 365
+            rho = strike * time_years * math.exp(-rate * time_years) * norm_cdf(d2) / 100
+        else:
+            delta = norm_cdf(d1) - 1
+            theta = (-(spot * norm_pdf(d1) * volatility) / (2 * math.sqrt(time_years)) + rate * strike * math.exp(-rate * time_years) * norm_cdf(-d2)) / 365
+            rho = -strike * time_years * math.exp(-rate * time_years) * norm_cdf(-d2) / 100
+
+        return {
+            "delta": round(delta, 4),
+            "gamma": round(gamma, 6),
+            "theta": round(theta, 4),
+            "vega": round(vega, 4),
+            "rho": round(rho, 4),
+        }
+    except Exception:
+        return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "rho": 0}
 
 
 def parse_expiry_for_ml(expiry_text):
@@ -583,6 +739,21 @@ def build_pcr_ml_snapshot(symbols, context, nifty, now):
     days_to_expiry = (expiry_date - now.date()).days if expiry_date else ""
     is_expiry_day, is_pre_expiry_day, is_post_expiry_day, expiry_type = get_expiry_features(expiry_date, now)
 
+    # ATM option Greeks are calculated from ATM CE/PE LTP using Black-Scholes.
+    # If broker/API gives no IV directly, IV is reverse-calculated from premium.
+    atm_strike = float(context.get("atm", 0) or 0)
+    atm_ce_data = option_by_token.get(context.get("atm_ce_token"), {})
+    atm_pe_data = option_by_token.get(context.get("atm_pe_token"), {})
+    atm_ce_ltp = safe_float(atm_ce_data.get("ltp", 0))
+    atm_pe_ltp = safe_float(atm_pe_data.get("ltp", 0))
+    risk_free_rate = 0.06
+    greeks_days = days_to_expiry if isinstance(days_to_expiry, int) and days_to_expiry >= 0 else 1
+    time_years = max(float(greeks_days), 1) / 365.0
+    atm_ce_iv = implied_volatility(atm_ce_ltp, float(nifty), atm_strike, time_years, risk_free_rate, "CE") if atm_strike else 0
+    atm_pe_iv = implied_volatility(atm_pe_ltp, float(nifty), atm_strike, time_years, risk_free_rate, "PE") if atm_strike else 0
+    atm_ce_greeks = calculate_option_greeks(float(nifty), atm_strike, greeks_days, risk_free_rate, atm_ce_iv, "CE") if atm_strike else {"delta":0,"gamma":0,"theta":0,"vega":0,"rho":0}
+    atm_pe_greeks = calculate_option_greeks(float(nifty), atm_strike, greeks_days, risk_free_rate, atm_pe_iv, "PE") if atm_strike else {"delta":0,"gamma":0,"theta":0,"vega":0,"rho":0}
+
     nifty_change_1min = get_snapshot_nifty_change(1, nifty)
     nifty_change_5min = get_snapshot_nifty_change(5, nifty)
     nifty_change_15min = get_snapshot_nifty_change(15, nifty)
@@ -632,6 +803,20 @@ def build_pcr_ml_snapshot(symbols, context, nifty, now):
         "NIFTY_CHANGE_1MIN": nifty_change_1min,
         "NIFTY_CHANGE_5MIN": nifty_change_5min,
         "NIFTY_CHANGE_15MIN": nifty_change_15min,
+        "ATM_CE_LTP": round(atm_ce_ltp, 2),
+        "ATM_PE_LTP": round(atm_pe_ltp, 2),
+        "ATM_CE_IV": atm_ce_iv,
+        "ATM_PE_IV": atm_pe_iv,
+        "ATM_CE_DELTA": atm_ce_greeks.get("delta", 0),
+        "ATM_CE_GAMMA": atm_ce_greeks.get("gamma", 0),
+        "ATM_CE_THETA": atm_ce_greeks.get("theta", 0),
+        "ATM_CE_VEGA": atm_ce_greeks.get("vega", 0),
+        "ATM_CE_RHO": atm_ce_greeks.get("rho", 0),
+        "ATM_PE_DELTA": atm_pe_greeks.get("delta", 0),
+        "ATM_PE_GAMMA": atm_pe_greeks.get("gamma", 0),
+        "ATM_PE_THETA": atm_pe_greeks.get("theta", 0),
+        "ATM_PE_VEGA": atm_pe_greeks.get("vega", 0),
+        "ATM_PE_RHO": atm_pe_greeks.get("rho", 0),
         "FUTURE_MOVE_15MIN": "",
         "FUTURE_MOVE_30MIN": "",
         "FUTURE_MOVE_60MIN": "",
@@ -675,6 +860,15 @@ def save_pcr_ml_snapshot(symbols, context, nifty, now):
             pcr_ml_snapshots = pcr_ml_snapshots[-500:]
 
         last_pcr_ml_save_minute = minute_key
+
+        # Backup ML/Greeks CSV to GitHub every configured interval, default 30 minutes.
+        upload_any_csv_to_github(
+            PCR_ML_FILE,
+            GITHUB_PCR_ML_PATH,
+            "PCR ML + ATM GREEKS HISTORY",
+            force=False,
+            last_sync_name="last_github_pcr_ml_sync_time"
+        )
 
         print(
             "PCR ML SNAPSHOT SAVED |",
@@ -851,7 +1045,7 @@ def login():
 
         if data and data.get("status"):
             print("LOGIN SUCCESS")
-            send_telegram("🌅 7 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
+            send_telegram("🌅 8 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
             return True
 
         print("LOGIN FAILED:", data)
@@ -884,6 +1078,360 @@ def safe_ltp(exchange, symbol, token, retry=3):
             login()
             time.sleep(3)
     return None
+
+
+# ==========================================================
+# MARKET SAFETY / STALE DATA HELPERS
+# ==========================================================
+def update_market_data_samples(nifty, call_price, put_price, pcr, atm_pcr, now):
+    global MARKET_DATA_SAMPLES
+    try:
+        sample = {
+            "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "nifty": round(float(nifty or 0), 2),
+            "call_price": round(float(call_price or 0), 2),
+            "put_price": round(float(put_price or 0), 2),
+            "pcr": round(float(pcr or 0), 4),
+            "atm_pcr": round(float(atm_pcr or 0), 4),
+        }
+        MARKET_DATA_SAMPLES.append(sample)
+        if len(MARKET_DATA_SAMPLES) > STATIC_DATA_MIN_SAMPLES:
+            MARKET_DATA_SAMPLES = MARKET_DATA_SAMPLES[-STATIC_DATA_MIN_SAMPLES:]
+    except Exception as e:
+        print("Market data sample update error:", e)
+
+
+def is_static_market_data():
+    """
+    Prevents fresh entries when broker API returns repeated/stale previous-close data.
+    On a real open market, NIFTY or option prices normally change within several samples.
+    """
+    try:
+        if not STATIC_DATA_CHECK_ENABLED:
+            return False
+        if len(MARKET_DATA_SAMPLES) < STATIC_DATA_MIN_SAMPLES:
+            return False
+
+        nifty_values = [s["nifty"] for s in MARKET_DATA_SAMPLES]
+        call_values = [s["call_price"] for s in MARKET_DATA_SAMPLES if s["call_price"] > 0]
+        put_values = [s["put_price"] for s in MARKET_DATA_SAMPLES if s["put_price"] > 0]
+        pcr_values = [s["pcr"] for s in MARKET_DATA_SAMPLES]
+
+        nifty_range = max(nifty_values) - min(nifty_values)
+        pcr_range = max(pcr_values) - min(pcr_values) if pcr_values else 0
+
+        call_range = 0
+        put_range = 0
+        if len(call_values) >= STATIC_DATA_MIN_SAMPLES:
+            call_range = max(call_values) - min(call_values)
+        if len(put_values) >= STATIC_DATA_MIN_SAMPLES:
+            put_range = max(put_values) - min(put_values)
+
+        option_static = (
+            len(call_values) >= STATIC_DATA_MIN_SAMPLES
+            and len(put_values) >= STATIC_DATA_MIN_SAMPLES
+            and call_range <= STATIC_DATA_MAX_OPTION_CHANGE_POINTS
+            and put_range <= STATIC_DATA_MAX_OPTION_CHANGE_POINTS
+        )
+
+        return (
+            nifty_range <= STATIC_DATA_MAX_NIFTY_CHANGE_POINTS
+            and option_static
+            and pcr_range <= STATIC_DATA_MAX_PCR_CHANGE
+        )
+    except Exception as e:
+        print("Static market data check error:", e)
+        return False
+
+
+def trading_entries_allowed(mode):
+    """Fresh paper entries are allowed only in confirmed live market with non-static data."""
+    if mode != "LIVE MARKET":
+        return False
+    if is_static_market_data():
+        return False
+    return True
+
+
+# ==========================================================
+# PERSISTENT NIFTY CANDLE HISTORY HELPERS
+# ==========================================================
+def normalize_candle(candle):
+    try:
+        return {
+            "date": str(candle.get("date", "")),
+            "minute": str(candle.get("minute", "")),
+            "open": round(float(candle.get("open", 0)), 2),
+            "high": round(float(candle.get("high", 0)), 2),
+            "low": round(float(candle.get("low", 0)), 2),
+            "close": round(float(candle.get("close", 0)), 2),
+            "vwap": round(float(candle.get("vwap", 0)), 2),
+        }
+    except Exception:
+        return None
+
+
+def github_configured():
+    return bool(GITHUB_TOKEN and GITHUB_REPO and GITHUB_BRANCH and GITHUB_CANDLE_PATH)
+
+
+def github_api_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "nifty-paper-trade-bot"
+    }
+
+
+def github_contents_url():
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_CANDLE_PATH}"
+
+
+def download_candle_history_from_github():
+    """
+    Downloads the last backed-up candle CSV from GitHub before local loading.
+    This is used after Railway restart/redeploy so indicator history is restored.
+    """
+    try:
+        if not github_configured():
+            print("GitHub candle restore skipped: GITHUB_TOKEN/GITHUB_REPO not configured")
+            return False
+
+        params = {"ref": GITHUB_BRANCH}
+        response = requests.get(github_contents_url(), headers=github_api_headers(), params=params, timeout=20)
+
+        if response.status_code == 404:
+            print("GitHub candle history not found yet. A new file will be created on next sync.")
+            return False
+
+        if response.status_code not in [200, 201]:
+            print("GitHub candle restore failed:", response.status_code, response.text[:300])
+            log_error(f"GitHub candle restore failed: {response.status_code} {response.text[:300]}")
+            return False
+
+        data = response.json()
+        encoded_content = data.get("content", "")
+        if not encoded_content:
+            print("GitHub candle restore skipped: empty content")
+            return False
+
+        csv_bytes = base64.b64decode(encoded_content)
+        with open(CANDLE_HISTORY_FILE, "wb") as f:
+            f.write(csv_bytes)
+
+        print(f"GitHub candle history restored to {CANDLE_HISTORY_FILE}")
+        send_telegram(
+            "📥 CANDLE HISTORY RESTORED FROM GITHUB\n"
+            f"Repo: {GITHUB_REPO}\n"
+            f"Path: {GITHUB_CANDLE_PATH}\n"
+            f"Branch: {GITHUB_BRANCH}"
+        )
+        return True
+
+    except Exception as e:
+        print("GitHub Candle Download Error:", e)
+        log_error(str(e))
+        return False
+
+
+
+def upload_any_csv_to_github(local_file, github_path, label, force=False, last_sync_name=None):
+    """Generic GitHub overwrite backup for CSV files."""
+    try:
+        if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BRANCH and github_path):
+            return False
+        if not os.path.exists(local_file):
+            return False
+
+        now = ist_now()
+        if last_sync_name and not force:
+            last_sync = globals().get(last_sync_name)
+            if last_sync is not None:
+                elapsed = (now - last_sync).total_seconds()
+                if elapsed < GITHUB_SYNC_INTERVAL_SECONDS:
+                    return False
+
+        with open(local_file, "rb") as f:
+            raw_bytes = f.read()
+        if not raw_bytes:
+            return False
+
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{github_path}"
+        sha = None
+        get_response = requests.get(url, headers=github_api_headers(), params={"ref": GITHUB_BRANCH}, timeout=20)
+        if get_response.status_code in [200, 201]:
+            sha = get_response.json().get("sha")
+        elif get_response.status_code != 404:
+            print(f"GitHub {label} SHA fetch failed:", get_response.status_code, get_response.text[:300])
+            log_error(f"GitHub {label} SHA fetch failed: {get_response.status_code} {get_response.text[:300]}")
+            return False
+
+        payload = {
+            "message": f"Auto backup {label} {now.strftime('%Y-%m-%d %H:%M:%S')}",
+            "content": base64.b64encode(raw_bytes).decode("utf-8"),
+            "branch": GITHUB_BRANCH
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_response = requests.put(url, headers=github_api_headers(), json=payload, timeout=30)
+        if put_response.status_code not in [200, 201]:
+            print(f"GitHub {label} upload failed:", put_response.status_code, put_response.text[:500])
+            log_error(f"GitHub {label} upload failed: {put_response.status_code} {put_response.text[:500]}")
+            return False
+
+        if last_sync_name:
+            globals()[last_sync_name] = now
+        print(f"{label} BACKED UP TO GITHUB: {GITHUB_REPO}/{github_path}")
+        return True
+
+    except Exception as e:
+        print(f"GitHub {label} Upload Error:", e)
+        log_error(str(e))
+        return False
+
+
+def upload_candle_history_to_github(force=False):
+    """
+    Overwrites the same candle CSV in GitHub every 30 minutes.
+    This protects strategy candle history if Railway restarts or local files are lost.
+    """
+    global last_github_candle_sync_time
+
+    try:
+        if not github_configured():
+            return False
+
+        if not os.path.exists(CANDLE_HISTORY_FILE):
+            return False
+
+        now = ist_now()
+        if not force and last_github_candle_sync_time is not None:
+            elapsed = (now - last_github_candle_sync_time).total_seconds()
+            if elapsed < GITHUB_SYNC_INTERVAL_SECONDS:
+                return False
+
+        with open(CANDLE_HISTORY_FILE, "rb") as f:
+            raw_bytes = f.read()
+
+        if not raw_bytes:
+            return False
+
+        # Get current SHA if file already exists. Required by GitHub for overwrite/update.
+        sha = None
+        get_response = requests.get(
+            github_contents_url(),
+            headers=github_api_headers(),
+            params={"ref": GITHUB_BRANCH},
+            timeout=20
+        )
+        if get_response.status_code in [200, 201]:
+            sha = get_response.json().get("sha")
+        elif get_response.status_code != 404:
+            print("GitHub SHA fetch failed:", get_response.status_code, get_response.text[:300])
+            log_error(f"GitHub SHA fetch failed: {get_response.status_code} {get_response.text[:300]}")
+            return False
+
+        payload = {
+            "message": f"Auto backup NIFTY candle history {now.strftime('%Y-%m-%d %H:%M:%S')}",
+            "content": base64.b64encode(raw_bytes).decode("utf-8"),
+            "branch": GITHUB_BRANCH
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_response = requests.put(github_contents_url(), headers=github_api_headers(), json=payload, timeout=30)
+        if put_response.status_code not in [200, 201]:
+            print("GitHub candle upload failed:", put_response.status_code, put_response.text[:500])
+            log_error(f"GitHub candle upload failed: {put_response.status_code} {put_response.text[:500]}")
+            return False
+
+        last_github_candle_sync_time = now
+        print(f"CANDLE HISTORY BACKED UP TO GITHUB: {GITHUB_REPO}/{GITHUB_CANDLE_PATH}")
+        send_telegram(
+            "📤 CANDLE HISTORY BACKED UP TO GITHUB\n"
+            f"Candles: {len(nifty_candles)}\n"
+            f"Path: {GITHUB_CANDLE_PATH}\n"
+            f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return True
+
+    except Exception as e:
+        print("GitHub Candle Upload Error:", e)
+        log_error(str(e))
+        return False
+
+
+def save_candle_history():
+    """
+    Saves completed 1-minute NIFTY candles to local CSV immediately.
+    GitHub backup is throttled and overwrites the same CSV every 30 minutes.
+    """
+    try:
+        candles_to_save = nifty_candles[-MAX_CANDLE_HISTORY:]
+        with open(CANDLE_HISTORY_FILE, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["date", "minute", "open", "high", "low", "close", "vwap"])
+            writer.writeheader()
+            for candle in candles_to_save:
+                row = normalize_candle(candle)
+                if row:
+                    writer.writerow(row)
+
+        upload_candle_history_to_github(force=False)
+
+    except Exception as e:
+        print("Candle History Save Error:", e)
+        log_error(str(e))
+
+
+def load_candle_history():
+    """
+    First tries to download candle history CSV from GitHub.
+    Then loads today's candles from CSV into memory for strategy calculations.
+    """
+    global nifty_candles, session_price_sum, session_price_count, current_vwap, last_vwap
+
+    try:
+        download_candle_history_from_github()
+
+        if not os.path.exists(CANDLE_HISTORY_FILE):
+            print("No candle history file found. Fresh candle collection will start.")
+            return
+
+        today = ist_now().strftime("%Y-%m-%d")
+        loaded = []
+        with open(CANDLE_HISTORY_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Intraday indicators must use today's candles only.
+                if row.get("date") != today:
+                    continue
+                candle = normalize_candle(row)
+                if candle:
+                    loaded.append(candle)
+
+        # Remove duplicate minute entries and keep latest value.
+        candle_by_minute = {}
+        for candle in loaded:
+            candle_by_minute[candle["minute"]] = candle
+        loaded = [candle_by_minute[k] for k in sorted(candle_by_minute.keys())]
+
+        nifty_candles = loaded[-MAX_CANDLE_HISTORY:]
+
+        if nifty_candles:
+            session_price_sum = sum(float(c["close"]) for c in nifty_candles)
+            session_price_count = len(nifty_candles)
+            current_vwap = round(session_price_sum / session_price_count, 2)
+            last_vwap = current_vwap
+            print(f"CANDLE HISTORY LOADED: {len(nifty_candles)} candles from {CANDLE_HISTORY_FILE}")
+            send_telegram(f"📚 NIFTY CANDLE HISTORY LOADED\nCandles: {len(nifty_candles)}\nFile: {CANDLE_HISTORY_FILE}")
+        else:
+            print("Candle history file found, but no today's candles available.")
+
+    except Exception as e:
+        print("Candle History Load Error:", e)
+        log_error(str(e))
 
 # ==========================================================
 # SMC + VWAP HELPERS
@@ -931,8 +1479,9 @@ def update_vwap_and_candle(nifty, now):
         current_candle["vwap"] = current_vwap
     else:
         nifty_candles.append(current_candle)
-        if len(nifty_candles) > 60:
-            nifty_candles = nifty_candles[-60:]
+        if len(nifty_candles) > MAX_CANDLE_HISTORY:
+            nifty_candles = nifty_candles[-MAX_CANDLE_HISTORY:]
+        save_candle_history()
         current_candle = {
             "date": now.strftime("%Y-%m-%d"),
             "minute": minute_key,
@@ -2245,6 +2794,175 @@ def check_gamma_exit(trade, current_price, nifty, context, now):
     return None, None
 
 
+
+# ==========================================================
+# STOP LOSS HUNTING STRATEGY HELPERS - STRATEGY 8
+# ==========================================================
+def sl_hunt_cooldown_ok(now):
+    if last_sl_hunt_entry_time is None:
+        return True
+    try:
+        return (now - last_sl_hunt_entry_time).total_seconds() >= SL_HUNT_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+
+def get_sl_hunt_state():
+    candles = get_all_working_candles()
+    if len(candles) < SL_HUNT_MIN_CANDLES_REQUIRED:
+        return None
+
+    completed = list(nifty_candles)
+    if len(completed) < SL_HUNT_LOOKBACK_CANDLES:
+        return None
+
+    recent = completed[-SL_HUNT_LOOKBACK_CANDLES:]
+    return {
+        "recent_high": round(max(float(c["high"]) for c in recent), 2),
+        "recent_low": round(min(float(c["low"]) for c in recent), 2),
+    }
+
+
+def get_sl_hunt_signal(nifty, pcr_change_3min, atm_pcr_change_3min):
+    """
+    Strategy-8 Stop Loss Hunting:
+    BUY CE after downside liquidity sweep:
+      - current candle low breaks recent swing low
+      - candle closes back above that low
+      - bullish rejection body / lower wick
+      - optional VWAP and PCR filters
+
+    BUY PE after upside liquidity sweep:
+      - current candle high breaks recent swing high
+      - candle closes back below that high
+      - bearish rejection body / upper wick
+      - optional VWAP and PCR filters
+    """
+    global last_sl_hunt_signal_key
+
+    if not SL_HUNT_ENABLED:
+        return None, None
+
+    if current_candle is None or len(nifty_candles) < SL_HUNT_MIN_CANDLES_REQUIRED:
+        return None, None
+
+    recent = nifty_candles[-SL_HUNT_LOOKBACK_CANDLES:]
+    recent_high = max(float(c["high"]) for c in recent)
+    recent_low = min(float(c["low"]) for c in recent)
+
+    candle_open = float(current_candle["open"])
+    candle_high = float(current_candle["high"])
+    candle_low = float(current_candle["low"])
+    candle_close = float(nifty)
+
+    body = abs(candle_close - candle_open)
+    if body < SL_HUNT_MIN_BODY_POINTS:
+        return None, None
+
+    upper_wick = candle_high - max(candle_open, candle_close)
+    lower_wick = min(candle_open, candle_close) - candle_low
+
+    downside_sweep = candle_low <= recent_low - SL_HUNT_SWEEP_BUFFER_POINTS
+    upside_sweep = candle_high >= recent_high + SL_HUNT_SWEEP_BUFFER_POINTS
+
+    bullish_reclaim = candle_close >= recent_low + SL_HUNT_RECLAIM_BUFFER_POINTS and candle_close > candle_open
+    bearish_reclaim = candle_close <= recent_high - SL_HUNT_RECLAIM_BUFFER_POINTS and candle_close < candle_open
+
+    strong_lower_rejection = lower_wick >= body * SL_HUNT_MIN_WICK_RATIO
+    strong_upper_rejection = upper_wick >= body * SL_HUNT_MIN_WICK_RATIO
+
+    vwap_ce_ok = True
+    vwap_pe_ok = True
+    if SL_HUNT_USE_VWAP_FILTER:
+        if current_vwap is None:
+            return None, None
+        # For reversal entries, allow price near/reclaiming VWAP; don't make it too strict.
+        vwap_ce_ok = candle_close >= float(current_vwap) - 10
+        vwap_pe_ok = candle_close <= float(current_vwap) + 10
+
+    pcr_ce_ok = True
+    pcr_pe_ok = True
+    if SL_HUNT_USE_PCR_FILTER:
+        # Avoid CE if PCR is strongly falling, avoid PE if PCR is strongly rising.
+        pcr_ce_ok = not (pcr_change_3min < -ENTRY_PCR_CHANGE or atm_pcr_change_3min < -ENTRY_ATM_PCR_CHANGE)
+        pcr_pe_ok = not (pcr_change_3min > ENTRY_PCR_CHANGE or atm_pcr_change_3min > ENTRY_ATM_PCR_CHANGE)
+
+    minute_key = current_candle.get("minute", "")
+
+    if downside_sweep and bullish_reclaim and strong_lower_rejection and vwap_ce_ok and pcr_ce_ok:
+        key = f"CE_{minute_key}_{round(recent_low,2)}"
+        if last_sl_hunt_signal_key == key:
+            return None, None
+        last_sl_hunt_signal_key = key
+        trigger = (
+            f"SL_HUNT BUY CE: Downside stop-loss sweep below {round(recent_low,2)}, "
+            f"low {round(candle_low,2)}, close reclaimed {round(candle_close,2)}, "
+            f"lower wick {round(lower_wick,2)}, VWAP {current_vwap}"
+        )
+        return "BUY CE", trigger
+
+    if upside_sweep and bearish_reclaim and strong_upper_rejection and vwap_pe_ok and pcr_pe_ok:
+        key = f"PE_{minute_key}_{round(recent_high,2)}"
+        if last_sl_hunt_signal_key == key:
+            return None, None
+        last_sl_hunt_signal_key = key
+        trigger = (
+            f"SL_HUNT BUY PE: Upside stop-loss sweep above {round(recent_high,2)}, "
+            f"high {round(candle_high,2)}, close rejected {round(candle_close,2)}, "
+            f"upper wick {round(upper_wick,2)}, VWAP {current_vwap}"
+        )
+        return "BUY PE", trigger
+
+    return None, None
+
+
+def update_sl_hunt_trade_protection(trade, current_price):
+    entry_price = float(trade["entry_price"])
+    current_price = float(current_price)
+    profit_percent = round(((current_price - entry_price) / entry_price) * 100, 2)
+
+    highest_price = float(trade.get("highest_price", entry_price))
+    if current_price > highest_price:
+        highest_price = current_price
+        trade["highest_price"] = round(highest_price, 2)
+
+    current_sl = float(trade.get("trailing_sl_price", entry_price * (1 - SL_HUNT_OPTION_SL_PERCENT / 100)))
+    new_sl = current_sl
+
+    if profit_percent >= SL_HUNT_BREAKEVEN_PERCENT:
+        new_sl = max(new_sl, entry_price)
+
+    new_sl = round(new_sl, 2)
+    if new_sl != round(current_sl, 2):
+        trade["trailing_sl_price"] = new_sl
+        save_active_trades()
+
+    return profit_percent, new_sl
+
+
+def check_sl_hunt_exit(trade, current_price, nifty):
+    if current_price is None:
+        return None, None
+
+    profit_percent, trailing_sl = update_sl_hunt_trade_protection(trade, current_price)
+
+    if float(current_price) <= float(trailing_sl):
+        return "SL_HUNT SL HIT", f"Option {round(float(current_price),2)} <= SL {trailing_sl}, P/L {profit_percent}%"
+
+    if profit_percent >= SL_HUNT_TARGET_PERCENT:
+        return "SL_HUNT TARGET HIT", f"Option profit {profit_percent}%"
+
+    # Exit if reversal fails beyond current candle sweep opposite side.
+    if len(nifty_candles) >= 1:
+        prev = nifty_candles[-1]
+        if trade["trade_type"] == "BUY CE" and float(nifty) < float(prev["low"]):
+            return "SL_HUNT CE REVERSAL FAILED", f"NIFTY {round(float(nifty),2)} below previous candle low {round(float(prev['low']),2)}"
+        if trade["trade_type"] == "BUY PE" and float(nifty) > float(prev["high"]):
+            return "SL_HUNT PE REVERSAL FAILED", f"NIFTY {round(float(nifty),2)} above previous candle high {round(float(prev['high']),2)}"
+
+    return None, None
+
+
 # ==========================================================
 # EXIT LOGIC FOR ALL STRATEGIES
 # ==========================================================
@@ -2275,6 +2993,10 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
     # Strategy-6 Supertrend + EMA has separate percentage trailing exit.
     elif strategy_name == SUPER_EMA_NAME:
         exit_reason, exit_trigger = check_super_ema_exit(trade, current_price, nifty)
+
+    # Strategy-8 Stop Loss Hunt has separate percentage protection.
+    elif strategy_name == SL_HUNT_NAME:
+        exit_reason, exit_trigger = check_sl_hunt_exit(trade, current_price, nifty)
 
     # Common SL / Target for PCR and SMC
     elif points <= -STOPLOSS_POINTS:
@@ -2382,6 +3104,10 @@ def create_trade(strategy_name, trade_type, symbol, token, price, time_str, nift
         trade["highest_price"] = round(price, 2)
         trade["trailing_sl_price"] = round(price * (1 - GAMMA_OPTION_HARD_SL_PERCENT / 100), 2)
 
+    if strategy_name == SL_HUNT_NAME:
+        trade["highest_price"] = round(price, 2)
+        trade["trailing_sl_price"] = round(price * (1 - SL_HUNT_OPTION_SL_PERCENT / 100), 2)
+
     return trade
 
 
@@ -2410,6 +3136,7 @@ def enter_trade(strategy_name, trade):
 # ==========================================================
 init_paper_file()
 init_pcr_ml_file()
+load_candle_history()
 init_google_sheet()
 load_active_trades()
 
@@ -2429,15 +3156,23 @@ while True:
         time_str = now.strftime("%Y-%m-%d %H:%M:%S")
         mode = market_mode(now)
 
+        if mode == "HOLIDAY":
+            print(f"HOLIDAY - NSE/BSE closed. No fresh entries or exits using stale data. Time: {time_str}")
+            if now.hour in [9, 12, 15] and last_heartbeat_hour != now.hour:
+                send_telegram(f"🛑 NSE/BSE HOLIDAY - BOT SAFE MODE\nNo paper entries today.\nTime: {time_str}")
+                last_heartbeat_hour = now.hour
+            time.sleep(1800)
+            continue
+
         # Sleep during closed market if there are no open paper trades.
         # Pre-open relogin at/after 08:45 helps prepare session before market.
         global_last_preopen_login_date = globals().get("last_preopen_login_date")
-        if mode in ["AFTER MARKET", "WEEKEND"] and not open_trades:
+        if mode in ["AFTER MARKET", "WEEKEND", "HOLIDAY"] and not open_trades:
             if mode == "AFTER MARKET" and now.hour == 8 and now.minute >= 45 and global_last_preopen_login_date != now.date().isoformat():
                 if login():
                     globals()["last_preopen_login_date"] = now.date().isoformat()
                     send_telegram(f"🔐 PRE-MARKET AUTO LOGIN DONE\nTime: {time_str}")
-            sleep_time = 1800 if mode == "WEEKEND" else 300
+            sleep_time = 1800 if mode in ["WEEKEND", "HOLIDAY"] else 300
             print(f"{mode} - No open trades. Sleeping {sleep_time} seconds.")
             time.sleep(sleep_time)
             continue
@@ -2540,6 +3275,16 @@ while True:
         else:
             print("SUPER_EMA: collecting candles")
 
+        sl_hunt_state = get_sl_hunt_state()
+        if sl_hunt_state:
+            print(
+                "SL_HUNT:",
+                "Recent High", sl_hunt_state["recent_high"],
+                "Recent Low", sl_hunt_state["recent_low"]
+            )
+        else:
+            print("SL_HUNT: collecting candles")
+
         if GAMMA_BLAST_ENABLED:
             gamma_status = "ON" if is_gamma_expiry_day(now, context) and gamma_entry_time_ok(now) else "WAIT"
             print(
@@ -2565,6 +3310,11 @@ while True:
         if next_otm_pe_symbol and next_otm_pe_token:
             otm_put_price = safe_ltp("NFO", next_otm_pe_symbol, next_otm_pe_token)
 
+        update_market_data_samples(nifty, call_price, put_price, pcr, atm_pcr, now)
+        entry_allowed = trading_entries_allowed(mode)
+        if mode == "LIVE MARKET" and not entry_allowed:
+            print("ENTRY BLOCKED: Static/stale market data detected. Existing open trades will still be monitored.")
+
         # ==================================================
         # PCR ML DATA COLLECTION - SEPARATE SILENT MODULE
         # ==================================================
@@ -2587,7 +3337,7 @@ while True:
                     exited_strategies.add(strategy_name)
 
             # 2) Strategy-1 PCR entry
-            if "PCR" not in open_trades and "PCR" not in exited_strategies and sample_due:
+            if entry_allowed and "PCR" not in open_trades and "PCR" not in exited_strategies and sample_due:
                 ce_by_atm = atm_pcr_change_3min >= ENTRY_ATM_PCR_CHANGE
                 ce_by_pcr = pcr_change_3min >= ENTRY_PCR_CHANGE
                 pe_by_atm = atm_pcr_change_3min <= -ENTRY_ATM_PCR_CHANGE
@@ -2622,7 +3372,7 @@ while True:
                     enter_trade("PCR", trade)
 
             # 3) Strategy-2 SMC + VWAP entry
-            if "SMC" not in open_trades and "SMC" not in exited_strategies and smc_cooldown_ok(now):
+            if entry_allowed and "SMC" not in open_trades and "SMC" not in exited_strategies and smc_cooldown_ok(now):
                 smc_signal, smc_trigger = get_smc_signal(nifty)
 
                 if smc_signal == "BUY CE" and call_price is not None:
@@ -2642,7 +3392,7 @@ while True:
                     last_smc_entry_time = now
 
             # 4) Strategy-3 ADX entry
-            if "ADX" not in open_trades and "ADX" not in exited_strategies:
+            if entry_allowed and "ADX" not in open_trades and "ADX" not in exited_strategies:
                 adx_signal, adx_trigger = get_adx_signal(nifty)
 
                 if adx_signal == "BUY CE" and call_price is not None:
@@ -2660,7 +3410,7 @@ while True:
                     enter_trade("ADX", trade)
 
             # 5) Strategy-4 RSI + Stochastic + EMA entry
-            if RSI_STOCH_EMA_NAME not in open_trades and RSI_STOCH_EMA_NAME not in exited_strategies:
+            if entry_allowed and RSI_STOCH_EMA_NAME not in open_trades and RSI_STOCH_EMA_NAME not in exited_strategies:
                 rsi_stoch_signal, rsi_stoch_trigger = get_rsi_stoch_ema_signal(nifty, now)
 
                 if rsi_stoch_signal == "BUY CE" and call_price is not None:
@@ -2678,7 +3428,7 @@ while True:
                     enter_trade(RSI_STOCH_EMA_NAME, trade)
 
             # 6) Strategy-5 Pure Market Structure entry
-            if MARKET_STRUCTURE_NAME not in open_trades and MARKET_STRUCTURE_NAME not in exited_strategies and market_structure_cooldown_ok(now):
+            if entry_allowed and MARKET_STRUCTURE_NAME not in open_trades and MARKET_STRUCTURE_NAME not in exited_strategies and market_structure_cooldown_ok(now):
                 ms_signal, ms_trigger = get_market_structure_signal(nifty)
 
                 if ms_signal == "BUY CE" and call_price is not None:
@@ -2698,7 +3448,7 @@ while True:
                     last_market_structure_entry_time = now
 
             # 7) Strategy-6 Supertrend + EMA Crossover entry
-            if SUPER_EMA_NAME not in open_trades and SUPER_EMA_NAME not in exited_strategies and super_ema_cooldown_ok(now):
+            if entry_allowed and SUPER_EMA_NAME not in open_trades and SUPER_EMA_NAME not in exited_strategies and super_ema_cooldown_ok(now):
                 super_signal, super_trigger = get_super_ema_signal(nifty)
 
                 if super_signal == "BUY CE" and call_price is not None:
@@ -2720,7 +3470,8 @@ while True:
 
             # 8) Strategy-7 Gamma Blast Expiry entry
             if (
-                GAMMA_BLAST_NAME not in open_trades
+                entry_allowed
+                and GAMMA_BLAST_NAME not in open_trades
                 and GAMMA_BLAST_NAME not in exited_strategies
                 and gamma_cooldown_ok(now)
             ):
@@ -2751,6 +3502,28 @@ while True:
                     trade["entry_otm_pe_oi"] = option_by_token.get(context.get("next_otm_pe_token"), {}).get("oi", 0)
                     enter_trade(GAMMA_BLAST_NAME, trade)
                     last_gamma_entry_time = now
+
+            # 9) Strategy-8 Stop Loss Hunting entry
+            if entry_allowed and SL_HUNT_NAME not in open_trades and SL_HUNT_NAME not in exited_strategies and sl_hunt_cooldown_ok(now):
+                sl_hunt_signal, sl_hunt_trigger = get_sl_hunt_signal(
+                    nifty, pcr_change_3min, atm_pcr_change_3min
+                )
+
+                if sl_hunt_signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(
+                        SL_HUNT_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, sl_hunt_trigger
+                    )
+                    enter_trade(SL_HUNT_NAME, trade)
+                    last_sl_hunt_entry_time = now
+
+                elif sl_hunt_signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(
+                        SL_HUNT_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, sl_hunt_trigger
+                    )
+                    enter_trade(SL_HUNT_NAME, trade)
+                    last_sl_hunt_entry_time = now
 
             # Update Gamma comparison snapshot after all entry logic.
             update_gamma_snapshot(context, nifty, otm_call_price, otm_put_price)
