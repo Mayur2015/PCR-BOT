@@ -29,6 +29,15 @@ GOOGLE_CREDENTIALS_BASE64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
 smartApi = None
 google_sheet = None
 last_heartbeat_hour = -1
+last_heartbeat_time = None
+last_relogin_attempt_time = None
+
+# Telegram notification control
+TELEGRAM_NOTIFY_STARTUP = os.getenv("TELEGRAM_NOTIFY_STARTUP", "NO").upper() == "YES"
+TELEGRAM_NOTIFY_GITHUB = os.getenv("TELEGRAM_NOTIFY_GITHUB", "NO").upper() == "YES"
+TELEGRAM_NOTIFY_GOOGLE_CONNECT = os.getenv("TELEGRAM_NOTIFY_GOOGLE_CONNECT", "NO").upper() == "YES"
+TELEGRAM_HEARTBEAT_MINUTES = int(os.getenv("TELEGRAM_HEARTBEAT_MINUTES", "60"))
+RELOGIN_COOLDOWN_SECONDS = int(os.getenv("RELOGIN_COOLDOWN_SECONDS", "120"))
 
 # ==========================================================
 # PCR ML DATA COLLECTION GLOBALS
@@ -63,8 +72,12 @@ MAX_CANDLE_HISTORY = 300
 # GITHUB_PCR_ML_PATH = pcr_ml_history.csv optional
 # GITHUB_SYNC_INTERVAL_MINUTES = 30 optional. Default 30 minutes to limit max data loss.
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+# IMPORTANT: Do NOT write backup CSV to the same repo+branch Railway auto-deploys from.
+# Use a separate repo or a separate data branch, otherwise every CSV backup commit can restart Railway.
+GITHUB_CODE_REPO = os.getenv("GITHUB_REPO")
+GITHUB_CODE_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_BACKUP_REPO = os.getenv("GITHUB_BACKUP_REPO", GITHUB_CODE_REPO)
+GITHUB_BACKUP_BRANCH = os.getenv("GITHUB_BACKUP_BRANCH", os.getenv("GITHUB_DATA_BRANCH", "data-backup"))
 GITHUB_CANDLE_PATH = os.getenv("GITHUB_CANDLE_PATH", CANDLE_HISTORY_FILE)
 GITHUB_PCR_ML_PATH = os.getenv("GITHUB_PCR_ML_PATH", PCR_ML_FILE)
 GITHUB_SYNC_INTERVAL_MINUTES = int(os.getenv("GITHUB_SYNC_INTERVAL_MINUTES", "30"))
@@ -457,7 +470,8 @@ def init_google_sheet():
             pcr_ml_sheet.append_row(PCR_ML_HEADERS, value_input_option="USER_ENTERED")
 
         print("GOOGLE SHEET CONNECTED")
-        send_telegram("✅ GOOGLE SHEET CONNECTED SUCCESSFULLY")
+        if TELEGRAM_NOTIFY_GOOGLE_CONNECT:
+            send_telegram("✅ GOOGLE SHEET CONNECTED SUCCESSFULLY")
         return True
     except Exception as e:
         print("Google Sheet Init Error:", e)
@@ -1095,7 +1109,8 @@ def login():
 
         if data and data.get("status"):
             print("LOGIN SUCCESS")
-            send_telegram("🌅 13 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
+            if TELEGRAM_NOTIFY_STARTUP:
+                send_telegram("🌅 13 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
             return True
 
         print("LOGIN FAILED:", data)
@@ -1104,6 +1119,24 @@ def login():
     except Exception as e:
         print("LOGIN ERROR:", e)
         send_telegram(f"❌ LOGIN ERROR\n{e}")
+        return False
+
+
+
+def relogin_if_needed(reason=""):
+    """Throttle Angel relogin attempts so temporary API issues do not spam login calls."""
+    global last_relogin_attempt_time
+    now = ist_now()
+    try:
+        if last_relogin_attempt_time is not None:
+            if (now - last_relogin_attempt_time).total_seconds() < RELOGIN_COOLDOWN_SECONDS:
+                print(f"RELOGIN SKIPPED DUE TO COOLDOWN: {reason}")
+                return False
+        last_relogin_attempt_time = now
+        print(f"RELOGIN ATTEMPT: {reason}")
+        return login()
+    except Exception as e:
+        print("Relogin helper error:", e)
         return False
 
 # ==========================================================
@@ -1118,14 +1151,13 @@ def safe_ltp(exchange, symbol, token, retry=3):
                 return float(data["data"]["ltp"])
             if data and data.get("message") == "Invalid Token":
                 print("SESSION EXPIRED - RELOGIN")
-                send_telegram("♻️ SESSION EXPIRED - RELOGIN")
-                login()
+                relogin_if_needed("Invalid Token from LTP")
                 time.sleep(3)
         except Exception as e:
             print("LTP Retry Error:", e)
             log_error(str(e))
-            send_telegram(f"❌ LTP ERROR\n{e}")
-            login()
+            print(f"LTP ERROR: {e}")
+            relogin_if_needed("LTP exception")
             time.sleep(3)
     return None
 
@@ -1222,7 +1254,7 @@ def normalize_candle(candle):
 
 
 def github_configured():
-    return bool(GITHUB_TOKEN and GITHUB_REPO and GITHUB_BRANCH and GITHUB_CANDLE_PATH)
+    return bool(GITHUB_TOKEN and GITHUB_BACKUP_REPO and GITHUB_BACKUP_BRANCH and GITHUB_CANDLE_PATH)
 
 
 def github_api_headers():
@@ -1235,7 +1267,7 @@ def github_api_headers():
 
 
 def github_contents_url():
-    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_CANDLE_PATH}"
+    return f"https://api.github.com/repos/{GITHUB_BACKUP_REPO}/contents/{GITHUB_CANDLE_PATH}"
 
 
 def download_candle_history_from_github():
@@ -1248,7 +1280,7 @@ def download_candle_history_from_github():
             print("GitHub candle restore skipped: GITHUB_TOKEN/GITHUB_REPO not configured")
             return False
 
-        params = {"ref": GITHUB_BRANCH}
+        params = {"ref": GITHUB_BACKUP_BRANCH}
         response = requests.get(github_contents_url(), headers=github_api_headers(), params=params, timeout=20)
 
         if response.status_code == 404:
@@ -1271,12 +1303,13 @@ def download_candle_history_from_github():
             f.write(csv_bytes)
 
         print(f"GitHub candle history restored to {CANDLE_HISTORY_FILE}")
-        send_telegram(
-            "📥 CANDLE HISTORY RESTORED FROM GITHUB\n"
-            f"Repo: {GITHUB_REPO}\n"
-            f"Path: {GITHUB_CANDLE_PATH}\n"
-            f"Branch: {GITHUB_BRANCH}"
-        )
+        if TELEGRAM_NOTIFY_GITHUB:
+            send_telegram(
+                "📥 CANDLE HISTORY RESTORED FROM GITHUB\n"
+                f"Repo: {GITHUB_BACKUP_REPO}\n"
+                f"Path: {GITHUB_CANDLE_PATH}\n"
+                f"Branch: {GITHUB_BACKUP_BRANCH}"
+            )
         return True
 
     except Exception as e:
@@ -1289,7 +1322,7 @@ def download_candle_history_from_github():
 def upload_any_csv_to_github(local_file, github_path, label, force=False, last_sync_name=None):
     """Generic GitHub overwrite backup for CSV files."""
     try:
-        if not (GITHUB_TOKEN and GITHUB_REPO and GITHUB_BRANCH and github_path):
+        if not (GITHUB_TOKEN and GITHUB_BACKUP_REPO and GITHUB_BACKUP_BRANCH and github_path):
             return False
         if not os.path.exists(local_file):
             return False
@@ -1307,9 +1340,9 @@ def upload_any_csv_to_github(local_file, github_path, label, force=False, last_s
         if not raw_bytes:
             return False
 
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{github_path}"
+        url = f"https://api.github.com/repos/{GITHUB_BACKUP_REPO}/contents/{github_path}"
         sha = None
-        get_response = requests.get(url, headers=github_api_headers(), params={"ref": GITHUB_BRANCH}, timeout=20)
+        get_response = requests.get(url, headers=github_api_headers(), params={"ref": GITHUB_BACKUP_BRANCH}, timeout=20)
         if get_response.status_code in [200, 201]:
             sha = get_response.json().get("sha")
         elif get_response.status_code != 404:
@@ -1320,7 +1353,7 @@ def upload_any_csv_to_github(local_file, github_path, label, force=False, last_s
         payload = {
             "message": f"Auto backup {label} {now.strftime('%Y-%m-%d %H:%M:%S')}",
             "content": base64.b64encode(raw_bytes).decode("utf-8"),
-            "branch": GITHUB_BRANCH
+            "branch": GITHUB_BACKUP_BRANCH
         }
         if sha:
             payload["sha"] = sha
@@ -1333,7 +1366,7 @@ def upload_any_csv_to_github(local_file, github_path, label, force=False, last_s
 
         if last_sync_name:
             globals()[last_sync_name] = now
-        print(f"{label} BACKED UP TO GITHUB: {GITHUB_REPO}/{github_path}")
+        print(f"{label} BACKED UP TO GITHUB: {GITHUB_BACKUP_REPO}/{github_path} [{GITHUB_BACKUP_BRANCH}]")
         return True
 
     except Exception as e:
@@ -1373,7 +1406,7 @@ def upload_candle_history_to_github(force=False):
         get_response = requests.get(
             github_contents_url(),
             headers=github_api_headers(),
-            params={"ref": GITHUB_BRANCH},
+            params={"ref": GITHUB_BACKUP_BRANCH},
             timeout=20
         )
         if get_response.status_code in [200, 201]:
@@ -1386,7 +1419,7 @@ def upload_candle_history_to_github(force=False):
         payload = {
             "message": f"Auto backup NIFTY candle history {now.strftime('%Y-%m-%d %H:%M:%S')}",
             "content": base64.b64encode(raw_bytes).decode("utf-8"),
-            "branch": GITHUB_BRANCH
+            "branch": GITHUB_BACKUP_BRANCH
         }
         if sha:
             payload["sha"] = sha
@@ -1398,13 +1431,14 @@ def upload_candle_history_to_github(force=False):
             return False
 
         last_github_candle_sync_time = now
-        print(f"CANDLE HISTORY BACKED UP TO GITHUB: {GITHUB_REPO}/{GITHUB_CANDLE_PATH}")
-        send_telegram(
-            "📤 CANDLE HISTORY BACKED UP TO GITHUB\n"
-            f"Candles: {len(nifty_candles)}\n"
-            f"Path: {GITHUB_CANDLE_PATH}\n"
-            f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        print(f"CANDLE HISTORY BACKED UP TO GITHUB: {GITHUB_BACKUP_REPO}/{GITHUB_CANDLE_PATH} [{GITHUB_BACKUP_BRANCH}]")
+        if TELEGRAM_NOTIFY_GITHUB:
+            send_telegram(
+                "📤 CANDLE HISTORY BACKED UP TO GITHUB\n"
+                f"Candles: {len(nifty_candles)}\n"
+                f"Path: {GITHUB_CANDLE_PATH}\n"
+                f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
         return True
 
     except Exception as e:
@@ -1475,7 +1509,8 @@ def load_candle_history():
             current_vwap = round(session_price_sum / session_price_count, 2)
             last_vwap = current_vwap
             print(f"CANDLE HISTORY LOADED: {len(nifty_candles)} candles from {CANDLE_HISTORY_FILE}")
-            send_telegram(f"📚 NIFTY CANDLE HISTORY LOADED\nCandles: {len(nifty_candles)}\nFile: {CANDLE_HISTORY_FILE}")
+            if TELEGRAM_NOTIFY_GITHUB:
+                send_telegram(f"📚 NIFTY CANDLE HISTORY LOADED\nCandles: {len(nifty_candles)}\nFile: {CANDLE_HISTORY_FILE}")
         else:
             print("Candle history file found, but no today's candles available.")
 
@@ -3607,6 +3642,11 @@ symbols = load_symbol_master()
 if symbols is None:
     exit()
 
+# Avoid an immediate GitHub commit at startup. This prevents backup commits from triggering
+# instant Railway redeploy loops and keeps first sync for the configured interval.
+last_github_candle_sync_time = ist_now()
+last_github_pcr_ml_sync_time = ist_now()
+
 # ==========================================================
 # MAIN LOOP
 # ==========================================================
@@ -3637,10 +3677,11 @@ while True:
             time.sleep(sleep_time)
             continue
 
-        # Heartbeat every 2 hours
-        if now.hour % 2 == 0 and last_heartbeat_hour != now.hour:
-            send_telegram(f"✅ BOT RUNNING HEALTHY\nTime: {time_str}\nOpen Trades: {len(open_trades)}")
-            last_heartbeat_hour = now.hour
+        # Heartbeat at controlled interval only
+        global_last_heartbeat_time = globals().get("last_heartbeat_time")
+        if global_last_heartbeat_time is None or (now - global_last_heartbeat_time).total_seconds() >= TELEGRAM_HEARTBEAT_MINUTES * 60:
+            send_telegram(f"✅ BOT RUNNING HEALTHY\nTime: {time_str}\nMode: {mode}\nOpen Trades: {len(open_trades)}")
+            globals()["last_heartbeat_time"] = now
 
         nifty = safe_ltp("NSE", "NIFTY", "26000")
         if nifty is None:
@@ -4149,5 +4190,5 @@ while True:
         print("MAIN LOOP ERROR:", e)
         log_error(str(e))
         send_telegram(f"❌ MAIN LOOP ERROR\n{e}")
-        login()
+        relogin_if_needed("MAIN LOOP ERROR")
         time.sleep(5)
