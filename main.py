@@ -33,9 +33,9 @@ last_heartbeat_time = None
 last_relogin_attempt_time = None
 
 # Telegram notification control
-TELEGRAM_NOTIFY_STARTUP = os.getenv("TELEGRAM_NOTIFY_STARTUP", "NO").upper() == "YES"
-TELEGRAM_NOTIFY_GITHUB = os.getenv("TELEGRAM_NOTIFY_GITHUB", "NO").upper() == "YES"
-TELEGRAM_NOTIFY_GOOGLE_CONNECT = os.getenv("TELEGRAM_NOTIFY_GOOGLE_CONNECT", "NO").upper() == "YES"
+TELEGRAM_NOTIFY_STARTUP = os.getenv("TELEGRAM_NOTIFY_STARTUP", "YES").upper() == "YES"
+TELEGRAM_NOTIFY_GITHUB = os.getenv("TELEGRAM_NOTIFY_GITHUB", "YES").upper() == "YES"
+TELEGRAM_NOTIFY_GOOGLE_CONNECT = os.getenv("TELEGRAM_NOTIFY_GOOGLE_CONNECT", "YES").upper() == "YES"
 TELEGRAM_HEARTBEAT_MINUTES = int(os.getenv("TELEGRAM_HEARTBEAT_MINUTES", "60"))
 RELOGIN_COOLDOWN_SECONDS = int(os.getenv("RELOGIN_COOLDOWN_SECONDS", "120"))
 
@@ -1131,7 +1131,7 @@ def login():
         if data and data.get("status"):
             print("LOGIN SUCCESS")
             if TELEGRAM_NOTIFY_STARTUP:
-                send_telegram("🌅 13 STRATEGY PAPER SYSTEM STARTED SUCCESSFULLY")
+                send_telegram("🌅 STRATEGY LAB PAPER SYSTEM STARTED SUCCESSFULLY")
             return True
 
         print("LOGIN FAILED:", data)
@@ -3787,6 +3787,14 @@ while True:
             time.sleep(1800)
             continue
 
+        # Heartbeat at controlled interval only.
+        # This is intentionally placed BEFORE after-market sleeping,
+        # so Telegram health confirmation also comes when the bot is running but market is closed.
+        global_last_heartbeat_time = globals().get("last_heartbeat_time")
+        if global_last_heartbeat_time is None or (now - global_last_heartbeat_time).total_seconds() >= TELEGRAM_HEARTBEAT_MINUTES * 60:
+            send_telegram(f"✅ BOT RUNNING HEALTHY\nTime: {time_str}\nMode: {mode}\nOpen Trades: {len(open_trades)}")
+            globals()["last_heartbeat_time"] = now
+
         # Sleep during closed market if there are no open paper trades.
         # Pre-open relogin at/after 08:45 helps prepare session before market.
         global_last_preopen_login_date = globals().get("last_preopen_login_date")
@@ -3799,12 +3807,6 @@ while True:
             print(f"{mode} - No open trades. Sleeping {sleep_time} seconds.")
             time.sleep(sleep_time)
             continue
-
-        # Heartbeat at controlled interval only
-        global_last_heartbeat_time = globals().get("last_heartbeat_time")
-        if global_last_heartbeat_time is None or (now - global_last_heartbeat_time).total_seconds() >= TELEGRAM_HEARTBEAT_MINUTES * 60:
-            send_telegram(f"✅ BOT RUNNING HEALTHY\nTime: {time_str}\nMode: {mode}\nOpen Trades: {len(open_trades)}")
-            globals()["last_heartbeat_time"] = now
 
         nifty = safe_ltp("NSE", "NIFTY", "26000")
         if nifty is None:
