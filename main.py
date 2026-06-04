@@ -12,7 +12,7 @@ from google.oauth2.service_account import Credentials
 from SmartApi import SmartConnect
 import pyotp
 
-# ==========================================================
+# =========================================================
 # TELEGRAM CONFIG - Railway variables
 # ==========================================================
 TOKEN = os.getenv("TOKEN")
