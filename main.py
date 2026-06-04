@@ -120,14 +120,14 @@ STATIC_DATA_MAX_PCR_CHANGE = 0.001
 MARKET_DATA_SAMPLES = []
 
 # PCR Strategy settings
-PCR_SAMPLE_SECONDS = 180
-ENTRY_ATM_PCR_CHANGE = 0.30
-ENTRY_PCR_CHANGE = 0.07
-EXIT_PCR_STRONG_REVERSAL = 0.05
+PCR_SAMPLE_SECONDS = 60
+ENTRY_ATM_PCR_CHANGE = 0.30  # kept for ML/logs; PCR trade entry now uses only PCR change
+ENTRY_PCR_CHANGE = 0.25
+EXIT_PCR_STRONG_REVERSAL = 0.05  # not used for new PCR exit
 
 # Common option exit settings
 STOPLOSS_POINTS = 5
-TARGET_POINTS = 8
+TARGET_POINTS = 8  # kept for old/common strategies; PCR/variant labs use fixed 15 target
 
 # SMC + VWAP Strategy settings
 SMC_ENABLED = True
@@ -151,7 +151,8 @@ ADX_FALL_EXIT_CANDLES = 2          # exit if ADX falls for 2 candles
 
 # RSI + Stochastic + EMA Strategy settings
 RSI_STOCH_EMA_ENABLED = True
-RSI_STOCH_EMA_NAME = "RSI_STOCH_EMA"
+RSI_STOCH_EMA_NAME = "RSI_STOCH_EMA_A"
+RSI_STOCH_EMA_B_NAME = "RSI_STOCH_EMA_B"
 EMA_FAST_PERIOD = 25
 EMA_MID_PERIOD = 75
 EMA_SLOW_PERIOD = 140
@@ -182,7 +183,9 @@ MS_MIN_BODY_POINTS = 3          # candle body confirmation for breakout candle
 
 # Supertrend + EMA Crossover Strategy settings - Strategy 6
 SUPER_EMA_ENABLED = True
-SUPER_EMA_NAME = "SUPER_EMA"
+SUPER_EMA_NAME = "SUPER_EMA_A"
+SUPER_EMA_B_NAME = "SUPER_EMA_B"
+SUPER_EMA_C_NAME = "SUPER_EMA_C"
 SUPER_EMA_FAST_PERIOD = 5
 SUPER_EMA_SLOW_PERIOD = 20
 SUPER_EMA_ATR_PERIOD = 10
@@ -243,7 +246,9 @@ SL_HUNT_BREAKEVEN_PERCENT = 12
 # EMA 9/20 Crossover Scalping - Strategy 9
 # Pure 3-minute EMA crossover. No VWAP, no PCR, no SL/target. Exit only on opposite crossover.
 EMA9_20_ENABLED = True
-EMA9_20_NAME = "EMA9_20_3MIN"
+EMA9_20_NAME = "EMA9_20_A"
+EMA9_20_C_NAME = "EMA9_20_C"
+EMA9_20_D_NAME = "EMA9_20_D"
 EMA9_20_FAST = 9
 EMA9_20_SLOW = 20
 EMA9_20_MIN_3MIN_CANDLES = 25
@@ -251,7 +256,9 @@ EMA9_20_COOLDOWN_SECONDS = 300
 
 # Opening Range Breakout - Strategy 10
 ORB_ENABLED = True
-ORB_NAME = "ORB_15MIN"
+ORB_NAME = "ORB_CLASSIC"
+ORB_EMA9_TRAIL_NAME = "ORB_EMA9_TRAIL"
+ORB_HYBRID_NAME = "ORB_HYBRID"
 ORB_RANGE_MINUTES = 15
 ORB_BUFFER_POINTS = 5
 ORB_TARGET_MULTIPLIER = 2.0
@@ -279,6 +286,13 @@ VWAP_FALSE_BREAK_NAME = "VWAP_FALSE_BREAK"
 VWAP_FALSE_BREAK_MIN_BODY_POINTS = 3
 VWAP_FALSE_BREAK_MIN_CANDLES = 5
 VWAP_FALSE_BREAK_COOLDOWN_SECONDS = 600
+
+# Strategy lab fixed/protection exits
+LAB_FIXED_SL_POINTS = 5
+LAB_FIXED_TARGET_POINTS = 15
+LAB_BREAKEVEN_TRIGGER_POINTS = 10
+LAB_EMA_TRAIL_TRIGGER_POINTS = 15
+LAB_EMA_TRAIL_PERIOD = 9
 
 # PCR sample variables
 last_pcr_sample_time = None
@@ -325,6 +339,13 @@ last_bollinger_signal_key = None
 last_macd_signal_key = None
 last_vwap_false_break_entry_time = None
 last_vwap_false_break_signal_key = None
+
+last_rsi_stoch_ema_b_signal_key = None
+last_ema9_20_c_entry_time = None
+last_ema9_20_d_entry_time = None
+last_orb_variant_trade_date = None
+last_super_ema_b_entry_time = None
+last_super_ema_c_entry_time = None
 
 # ==========================================================
 # CSV / GOOGLE SHEET HEADERS
@@ -3438,6 +3459,115 @@ def check_vwap_false_break_exit(trade, nifty):
             return "VWAP RECLAIM EXIT", f"NIFTY {round(price,2)} back above VWAP {current_vwap}"
     return None, None
 
+
+# ==========================================================
+# STRATEGY LAB EXIT HELPERS - FIXED / EMA9 TRAIL / HYBRID
+# ==========================================================
+def get_ema_trail_state(period=9):
+    """Returns latest EMA trail level using NIFTY working candles."""
+    try:
+        candles = get_all_working_candles()
+        if len(candles) < period + 2:
+            return None
+        closes = [float(c["close"]) for c in candles]
+        ema_values = calculate_ema_series(closes, period)
+        if not ema_values:
+            return None
+        return {
+            "ema": round(ema_values[-1], 2),
+            "close": round(closes[-1], 2),
+            "minute": candles[-1].get("minute", "")
+        }
+    except Exception as e:
+        print("EMA trail state error:", e)
+        log_error(str(e))
+        return None
+
+
+def check_fixed_sl_target_exit(trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=LAB_FIXED_TARGET_POINTS, prefix="FIXED"):
+    """Fixed option premium SL/target exit."""
+    try:
+        points = round(float(current_price) - float(trade["entry_price"]), 2)
+        if points <= -abs(sl_points):
+            return f"{prefix} SL HIT", f"OPTION POINTS {points} <= -{abs(sl_points)}"
+        if points >= abs(target_points):
+            return f"{prefix} TARGET HIT", f"OPTION POINTS {points} >= {abs(target_points)}"
+    except Exception as e:
+        print("Fixed exit error:", e)
+        log_error(str(e))
+    return None, None
+
+
+def check_ema9_trail_exit(trade, current_price, nifty, prefix="EMA9 TRAIL"):
+    """
+    Initial SL = 5 premium points.
+    No fixed target.
+    Exit CE when NIFTY closes below EMA9.
+    Exit PE when NIFTY closes above EMA9.
+    """
+    exit_reason, exit_trigger = check_fixed_sl_target_exit(
+        trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=999999, prefix=prefix
+    )
+    if exit_reason:
+        return exit_reason, exit_trigger
+
+    state = get_ema_trail_state(LAB_EMA_TRAIL_PERIOD)
+    if state is None:
+        return None, None
+
+    price = float(nifty)
+    ema9 = float(state["ema"])
+    if trade["trade_type"] == "BUY CE" and price < ema9:
+        return f"{prefix} CE EMA9 EXIT", f"NIFTY {round(price,2)} closed below EMA9 {ema9}"
+    if trade["trade_type"] == "BUY PE" and price > ema9:
+        return f"{prefix} PE EMA9 EXIT", f"NIFTY {round(price,2)} closed above EMA9 {ema9}"
+
+    return None, None
+
+
+def check_hybrid_exit(trade, current_price, nifty, prefix="HYBRID"):
+    """
+    Initial SL = 5 premium points.
+    +10 points profit: stop moves to breakeven.
+    +15 points profit: EMA9 trailing activates.
+    """
+    try:
+        entry_price = float(trade["entry_price"])
+        current_price = float(current_price)
+        points = round(current_price - entry_price, 2)
+
+        if points <= -LAB_FIXED_SL_POINTS:
+            return f"{prefix} INITIAL SL HIT", f"OPTION POINTS {points} <= -{LAB_FIXED_SL_POINTS}"
+
+        if points >= LAB_BREAKEVEN_TRIGGER_POINTS and not trade.get("breakeven_active"):
+            trade["breakeven_active"] = True
+            trade["breakeven_price"] = entry_price
+            save_active_trades()
+
+        if trade.get("breakeven_active") and current_price <= float(trade.get("breakeven_price", entry_price)):
+            return f"{prefix} BREAKEVEN EXIT", f"After +{LAB_BREAKEVEN_TRIGGER_POINTS}, option returned to entry {entry_price}"
+
+        if points >= LAB_EMA_TRAIL_TRIGGER_POINTS and not trade.get("ema9_trail_active"):
+            trade["ema9_trail_active"] = True
+            save_active_trades()
+
+        if trade.get("ema9_trail_active"):
+            state = get_ema_trail_state(LAB_EMA_TRAIL_PERIOD)
+            if state is None:
+                return None, None
+            price = float(nifty)
+            ema9 = float(state["ema"])
+            if trade["trade_type"] == "BUY CE" and price < ema9:
+                return f"{prefix} CE EMA9 TRAIL EXIT", f"NIFTY {round(price,2)} closed below EMA9 {ema9}"
+            if trade["trade_type"] == "BUY PE" and price > ema9:
+                return f"{prefix} PE EMA9 TRAIL EXIT", f"NIFTY {round(price,2)} closed above EMA9 {ema9}"
+
+    except Exception as e:
+        print("Hybrid exit error:", e)
+        log_error(str(e))
+
+    return None, None
+
 # ==========================================================
 # EXIT LOGIC FOR ALL STRATEGIES
 # ==========================================================
@@ -3456,80 +3586,73 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
     exit_reason = None
     exit_trigger = None
 
+    # PCR new logic: 1-minute sample entry; exit only fixed SL/target. No PCR reversal exit.
+    if strategy_name == "PCR":
+        exit_reason, exit_trigger = check_fixed_sl_target_exit(
+            trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=LAB_FIXED_TARGET_POINTS, prefix="PCR"
+        )
+
     # Gamma Blast has expiry-specific OTM trailing and OI reversal exit.
-    if strategy_name == GAMMA_BLAST_NAME:
+    elif strategy_name == GAMMA_BLAST_NAME:
         gamma_context = context if context is not None else {}
         exit_reason, exit_trigger = check_gamma_exit(trade, current_price, nifty, gamma_context, ist_now())
 
-    # ADX has separate percentage based exit, so PCR and SMC remain unchanged.
     elif strategy_name == "ADX":
         exit_reason, exit_trigger = check_adx_exit(trade, current_price, nifty)
 
-    # Strategy-6 Supertrend + EMA has separate percentage trailing exit.
+    # SUPER_EMA family
     elif strategy_name == SUPER_EMA_NAME:
         exit_reason, exit_trigger = check_super_ema_exit(trade, current_price, nifty)
+    elif strategy_name == SUPER_EMA_B_NAME:
+        exit_reason, exit_trigger = check_fixed_sl_target_exit(
+            trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=LAB_FIXED_TARGET_POINTS, prefix=SUPER_EMA_B_NAME
+        )
+    elif strategy_name == SUPER_EMA_C_NAME:
+        exit_reason, exit_trigger = check_hybrid_exit(trade, current_price, nifty, prefix=SUPER_EMA_C_NAME)
 
-    # Strategy-8 Stop Loss Hunt has separate percentage protection.
     elif strategy_name == SL_HUNT_NAME:
         exit_reason, exit_trigger = check_sl_hunt_exit(trade, current_price, nifty)
 
-    # Strategy-9 EMA 9/20 3-minute exits only on opposite crossover.
+    # EMA9/20 family
     elif strategy_name == EMA9_20_NAME:
         exit_reason, exit_trigger = check_ema9_20_exit(trade)
+    elif strategy_name == EMA9_20_C_NAME:
+        exit_reason, exit_trigger = check_ema9_trail_exit(trade, current_price, nifty, prefix=EMA9_20_C_NAME)
+    elif strategy_name == EMA9_20_D_NAME:
+        exit_reason, exit_trigger = check_hybrid_exit(trade, current_price, nifty, prefix=EMA9_20_D_NAME)
 
-    # Strategy-10 ORB exits based on NIFTY range midpoint / 2X target.
+    # ORB family
     elif strategy_name == ORB_NAME:
         exit_reason, exit_trigger = check_orb_exit(trade, nifty)
+    elif strategy_name == ORB_EMA9_TRAIL_NAME:
+        exit_reason, exit_trigger = check_ema9_trail_exit(trade, current_price, nifty, prefix=ORB_EMA9_TRAIL_NAME)
+    elif strategy_name == ORB_HYBRID_NAME:
+        exit_reason, exit_trigger = check_hybrid_exit(trade, current_price, nifty, prefix=ORB_HYBRID_NAME)
 
-    # Strategy-11 Bollinger exits at mean or structure stop.
     elif strategy_name == BOLLINGER_NAME:
         exit_reason, exit_trigger = check_bollinger_exit(trade, nifty)
 
-    # Strategy-12 MACD histogram squeeze exits on histogram fade/failure.
     elif strategy_name == MACD_SQUEEZE_NAME:
         exit_reason, exit_trigger = check_macd_squeeze_exit(trade)
 
-    # Strategy-13 VWAP false break exits at session high/low, stop, or VWAP failure.
     elif strategy_name == VWAP_FALSE_BREAK_NAME:
         exit_reason, exit_trigger = check_vwap_false_break_exit(trade, nifty)
 
-    # Common SL / Target for PCR and SMC
+    # RSI family
+    elif strategy_name == RSI_STOCH_EMA_NAME:
+        exit_reason, exit_trigger = check_rsi_stoch_ema_exit(trade, nifty)
+    elif strategy_name == RSI_STOCH_EMA_B_NAME:
+        exit_reason, exit_trigger = check_fixed_sl_target_exit(
+            trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=LAB_FIXED_TARGET_POINTS, prefix=RSI_STOCH_EMA_B_NAME
+        )
+
+    # Common SL / Target for remaining simple strategies such as SMC
     elif points <= -STOPLOSS_POINTS:
         exit_reason = "STOPLOSS HIT"
         exit_trigger = f"OPTION POINTS {points}"
     elif points >= TARGET_POINTS:
         exit_reason = "TARGET HIT"
         exit_trigger = f"OPTION POINTS {points}"
-
-    # Extra RSI + Stochastic + EMA exit only for Strategy-4
-    elif strategy_name == RSI_STOCH_EMA_NAME:
-        exit_reason, exit_trigger = check_rsi_stoch_ema_exit(trade, nifty)
-
-    # Extra PCR reversal exit only for PCR strategy
-    elif strategy_name == "PCR" and sample_due:
-        if trade["trade_type"] == "BUY CE":
-            if pcr_change_3min <= -EXIT_PCR_STRONG_REVERSAL:
-                exit_reason = "CE EXIT - PCR STRONG DECREASE"
-                exit_trigger = f"PCR CHANGE {pcr_change_3min}"
-            elif pcr_change_3min < 0:
-                pcr_ce_decrease_count += 1
-                exit_trigger = f"PCR DECREASE COUNT {pcr_ce_decrease_count}, CHANGE {pcr_change_3min}"
-                if pcr_ce_decrease_count >= 2:
-                    exit_reason = "CE EXIT - PCR DECREASED TWICE"
-            else:
-                pcr_ce_decrease_count = 0
-
-        elif trade["trade_type"] == "BUY PE":
-            if pcr_change_3min >= EXIT_PCR_STRONG_REVERSAL:
-                exit_reason = "PE EXIT - PCR STRONG INCREASE"
-                exit_trigger = f"PCR CHANGE {pcr_change_3min}"
-            elif pcr_change_3min > 0:
-                pcr_pe_increase_count += 1
-                exit_trigger = f"PCR INCREASE COUNT {pcr_pe_increase_count}, CHANGE {pcr_change_3min}"
-                if pcr_pe_increase_count >= 2:
-                    exit_reason = "PE EXIT - PCR INCREASED TWICE"
-            else:
-                pcr_pe_increase_count = 0
 
     if not exit_reason:
         return False
@@ -3709,7 +3832,7 @@ while True:
         next_otm_pe_symbol = context["next_otm_pe_symbol"]
         next_otm_pe_token = context["next_otm_pe_token"]
 
-        # 3-minute PCR sample change
+        # 1-minute PCR sample change
         sample_due = False
         pcr_change_3min = 0
         atm_pcr_change_3min = 0
@@ -3730,7 +3853,7 @@ while True:
         print("============================")
         print("NIFTY:", round(nifty, 2))
         print("PCR:", round(pcr, 4), "| ATM PCR:", round(atm_pcr, 4))
-        print("3 Min PCR Change:", pcr_change_3min, "| 3 Min ATM PCR Change:", atm_pcr_change_3min)
+        print("1 Min PCR Change:", pcr_change_3min, "| 1 Min ATM PCR Change:", atm_pcr_change_3min)
         print("Max Pain:", max_pain)
         print("VWAP Approx:", current_vwap, "| Open Trades:", list(open_trades.keys()))
         adx_state = get_latest_adx_state()
@@ -3837,20 +3960,13 @@ while True:
                 if exited:
                     exited_strategies.add(strategy_name)
 
-            # 2) Strategy-1 PCR entry
+            # 2) Strategy-1 PCR entry - NEW LOGIC
+            # Check every 1 minute. Entry uses only PCR change.
+            # BUY CE: PCR change >= +0.25 | BUY PE: PCR change <= -0.25
+            # Exit is handled separately: SL 5 points / Target 15 points / Market close square-off.
             if entry_allowed and "PCR" not in open_trades and "PCR" not in exited_strategies and sample_due:
-                ce_by_atm = atm_pcr_change_3min >= ENTRY_ATM_PCR_CHANGE
-                ce_by_pcr = pcr_change_3min >= ENTRY_PCR_CHANGE
-                pe_by_atm = atm_pcr_change_3min <= -ENTRY_ATM_PCR_CHANGE
-                pe_by_pcr = pcr_change_3min <= -ENTRY_PCR_CHANGE
-
-                if (ce_by_atm or ce_by_pcr) and call_price is not None:
-                    if ce_by_atm and ce_by_pcr:
-                        entry_trigger = f"PCR CE OR BOTH: ATM PCR +{atm_pcr_change_3min}, PCR +{pcr_change_3min}"
-                    elif ce_by_atm:
-                        entry_trigger = f"PCR CE OR: ATM PCR +{atm_pcr_change_3min}"
-                    else:
-                        entry_trigger = f"PCR CE OR: PCR +{pcr_change_3min}"
+                if pcr_change_3min >= ENTRY_PCR_CHANGE and call_price is not None:
+                    entry_trigger = f"PCR NEW BUY CE: 1-min PCR change +{pcr_change_3min} >= +{ENTRY_PCR_CHANGE}"
 
                     trade = create_trade(
                         "PCR", "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
@@ -3858,13 +3974,8 @@ while True:
                     )
                     enter_trade("PCR", trade)
 
-                elif (pe_by_atm or pe_by_pcr) and put_price is not None:
-                    if pe_by_atm and pe_by_pcr:
-                        entry_trigger = f"PCR PE OR BOTH: ATM PCR {atm_pcr_change_3min}, PCR {pcr_change_3min}"
-                    elif pe_by_atm:
-                        entry_trigger = f"PCR PE OR: ATM PCR {atm_pcr_change_3min}"
-                    else:
-                        entry_trigger = f"PCR PE OR: PCR {pcr_change_3min}"
+                elif pcr_change_3min <= -ENTRY_PCR_CHANGE and put_price is not None:
+                    entry_trigger = f"PCR NEW BUY PE: 1-min PCR change {pcr_change_3min} <= -{ENTRY_PCR_CHANGE}"
 
                     trade = create_trade(
                         "PCR", "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
@@ -3910,23 +4021,30 @@ while True:
                     )
                     enter_trade("ADX", trade)
 
-            # 5) Strategy-4 RSI + Stochastic + EMA entry
-            if entry_allowed and RSI_STOCH_EMA_NAME not in open_trades and RSI_STOCH_EMA_NAME not in exited_strategies:
+            # 5) RSI_STOCH_EMA family entry
+            # A = current exit logic. B = same entry, fixed SL 5 / Target 15 / Market close only.
+            if entry_allowed:
                 rsi_stoch_signal, rsi_stoch_trigger = get_rsi_stoch_ema_signal(nifty, now)
 
                 if rsi_stoch_signal == "BUY CE" and call_price is not None:
-                    trade = create_trade(
-                        RSI_STOCH_EMA_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
-                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, rsi_stoch_trigger
-                    )
-                    enter_trade(RSI_STOCH_EMA_NAME, trade)
+                    for rsi_strategy_name in [RSI_STOCH_EMA_NAME, RSI_STOCH_EMA_B_NAME]:
+                        if rsi_strategy_name not in open_trades and rsi_strategy_name not in exited_strategies:
+                            trade = create_trade(
+                                rsi_strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                                rsi_stoch_trigger.replace("RSI_STOCH_EMA", rsi_strategy_name)
+                            )
+                            enter_trade(rsi_strategy_name, trade)
 
                 elif rsi_stoch_signal == "BUY PE" and put_price is not None:
-                    trade = create_trade(
-                        RSI_STOCH_EMA_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
-                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, rsi_stoch_trigger
-                    )
-                    enter_trade(RSI_STOCH_EMA_NAME, trade)
+                    for rsi_strategy_name in [RSI_STOCH_EMA_NAME, RSI_STOCH_EMA_B_NAME]:
+                        if rsi_strategy_name not in open_trades and rsi_strategy_name not in exited_strategies:
+                            trade = create_trade(
+                                rsi_strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                                rsi_stoch_trigger.replace("RSI_STOCH_EMA", rsi_strategy_name)
+                            )
+                            enter_trade(rsi_strategy_name, trade)
 
             # 6) Strategy-5 Pure Market Structure entry
             if entry_allowed and MARKET_STRUCTURE_NAME not in open_trades and MARKET_STRUCTURE_NAME not in exited_strategies and market_structure_cooldown_ok(now):
@@ -3948,24 +4066,31 @@ while True:
                     enter_trade(MARKET_STRUCTURE_NAME, trade)
                     last_market_structure_entry_time = now
 
-            # 7) Strategy-6 Supertrend + EMA Crossover entry
-            if entry_allowed and SUPER_EMA_NAME not in open_trades and SUPER_EMA_NAME not in exited_strategies and super_ema_cooldown_ok(now):
+            # 7) SUPER_EMA family entry
+            # A = current logic, B = fixed SL/target, C = hybrid breakeven + EMA9 trailing.
+            if entry_allowed and super_ema_cooldown_ok(now):
                 super_signal, super_trigger = get_super_ema_signal(nifty)
 
                 if super_signal == "BUY CE" and call_price is not None:
-                    trade = create_trade(
-                        SUPER_EMA_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
-                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, super_trigger
-                    )
-                    enter_trade(SUPER_EMA_NAME, trade)
+                    for super_strategy_name in [SUPER_EMA_NAME, SUPER_EMA_B_NAME, SUPER_EMA_C_NAME]:
+                        if super_strategy_name not in open_trades and super_strategy_name not in exited_strategies:
+                            trade = create_trade(
+                                super_strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                                super_trigger.replace("SUPER_EMA", super_strategy_name)
+                            )
+                            enter_trade(super_strategy_name, trade)
                     last_super_ema_entry_time = now
 
                 elif super_signal == "BUY PE" and put_price is not None:
-                    trade = create_trade(
-                        SUPER_EMA_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
-                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, super_trigger
-                    )
-                    enter_trade(SUPER_EMA_NAME, trade)
+                    for super_strategy_name in [SUPER_EMA_NAME, SUPER_EMA_B_NAME, SUPER_EMA_C_NAME]:
+                        if super_strategy_name not in open_trades and super_strategy_name not in exited_strategies:
+                            trade = create_trade(
+                                super_strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                                super_trigger.replace("SUPER_EMA", super_strategy_name)
+                            )
+                            enter_trade(super_strategy_name, trade)
                     last_super_ema_entry_time = now
 
 
@@ -4027,52 +4152,68 @@ while True:
                     last_sl_hunt_entry_time = now
 
 
-            # 10) Strategy-9 EMA 9/20 3-minute crossover entry
-            if entry_allowed and EMA9_20_NAME not in open_trades and EMA9_20_NAME not in exited_strategies and ema9_20_cooldown_ok(now):
+            # 10) EMA9/20 3-minute family entry
+            # A = current opposite-crossover exit, C = EMA9 trail, D = hybrid.
+            if entry_allowed and ema9_20_cooldown_ok(now):
                 ema_signal, ema_trigger = get_ema9_20_signal()
 
                 if ema_signal == "BUY CE" and call_price is not None:
-                    trade = create_trade(
-                        EMA9_20_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
-                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, ema_trigger
-                    )
-                    enter_trade(EMA9_20_NAME, trade)
+                    for ema_strategy_name in [EMA9_20_NAME, EMA9_20_C_NAME, EMA9_20_D_NAME]:
+                        if ema_strategy_name not in open_trades and ema_strategy_name not in exited_strategies:
+                            trade = create_trade(
+                                ema_strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                                ema_trigger.replace("EMA9_20_3MIN", ema_strategy_name)
+                            )
+                            enter_trade(ema_strategy_name, trade)
                     last_ema9_20_entry_time = now
 
                 elif ema_signal == "BUY PE" and put_price is not None:
-                    trade = create_trade(
-                        EMA9_20_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
-                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, ema_trigger
-                    )
-                    enter_trade(EMA9_20_NAME, trade)
+                    for ema_strategy_name in [EMA9_20_NAME, EMA9_20_C_NAME, EMA9_20_D_NAME]:
+                        if ema_strategy_name not in open_trades and ema_strategy_name not in exited_strategies:
+                            trade = create_trade(
+                                ema_strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                                ema_trigger.replace("EMA9_20_3MIN", ema_strategy_name)
+                            )
+                            enter_trade(ema_strategy_name, trade)
                     last_ema9_20_entry_time = now
 
-            # 11) Strategy-10 Opening Range Breakout entry
-            if entry_allowed and ORB_NAME not in open_trades and ORB_NAME not in exited_strategies:
+            # 11) ORB family entry
+            # ORB_CLASSIC = current midpoint/2X target
+            # ORB_EMA9_TRAIL = SL 5 + EMA9 trail, no target
+            # ORB_HYBRID = SL 5, +10 breakeven, +15 EMA9 trail
+            if entry_allowed:
                 orb_signal, orb_trigger, orb_levels = get_orb_signal(nifty, now)
 
                 if orb_signal == "BUY CE" and call_price is not None and orb_levels:
-                    trade = create_trade(
-                        ORB_NAME, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
-                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, orb_trigger
-                    )
-                    trade["orb_high"] = orb_levels["high"]
-                    trade["orb_low"] = orb_levels["low"]
-                    trade["orb_mid"] = orb_levels["mid"]
-                    trade["orb_target"] = round(orb_levels["high"] + (orb_levels["height"] * ORB_TARGET_MULTIPLIER), 2)
-                    enter_trade(ORB_NAME, trade)
+                    for orb_strategy_name in [ORB_NAME, ORB_EMA9_TRAIL_NAME, ORB_HYBRID_NAME]:
+                        if orb_strategy_name not in open_trades and orb_strategy_name not in exited_strategies:
+                            trade = create_trade(
+                                orb_strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str,
+                                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                                orb_trigger.replace("ORB", orb_strategy_name)
+                            )
+                            trade["orb_high"] = orb_levels["high"]
+                            trade["orb_low"] = orb_levels["low"]
+                            trade["orb_mid"] = orb_levels["mid"]
+                            trade["orb_target"] = round(orb_levels["high"] + (orb_levels["height"] * ORB_TARGET_MULTIPLIER), 2)
+                            enter_trade(orb_strategy_name, trade)
                     last_orb_trade_date = now.strftime("%Y-%m-%d")
 
                 elif orb_signal == "BUY PE" and put_price is not None and orb_levels:
-                    trade = create_trade(
-                        ORB_NAME, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
-                        nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, orb_trigger
-                    )
-                    trade["orb_high"] = orb_levels["high"]
-                    trade["orb_low"] = orb_levels["low"]
-                    trade["orb_mid"] = orb_levels["mid"]
-                    trade["orb_target"] = round(orb_levels["low"] - (orb_levels["height"] * ORB_TARGET_MULTIPLIER), 2)
-                    enter_trade(ORB_NAME, trade)
+                    for orb_strategy_name in [ORB_NAME, ORB_EMA9_TRAIL_NAME, ORB_HYBRID_NAME]:
+                        if orb_strategy_name not in open_trades and orb_strategy_name not in exited_strategies:
+                            trade = create_trade(
+                                orb_strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str,
+                                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                                orb_trigger.replace("ORB", orb_strategy_name)
+                            )
+                            trade["orb_high"] = orb_levels["high"]
+                            trade["orb_low"] = orb_levels["low"]
+                            trade["orb_mid"] = orb_levels["mid"]
+                            trade["orb_target"] = round(orb_levels["low"] - (orb_levels["height"] * ORB_TARGET_MULTIPLIER), 2)
+                            enter_trade(orb_strategy_name, trade)
                     last_orb_trade_date = now.strftime("%Y-%m-%d")
 
             # 12) Strategy-11 Bollinger Band Mean Reversion entry
@@ -4178,7 +4319,7 @@ while True:
                 )
                 remove_open_trade(strategy_name)
 
-        # Update 3-minute PCR sample after logic
+        # Update 1-minute PCR sample after logic
         if sample_due:
             sample_pcr = pcr
             sample_atm_pcr = atm_pcr
