@@ -361,25 +361,40 @@ HEADERS = [
 
 
 # ==========================================================
-# PCR ML GOOGLE SHEET / CSV HEADERS
+# PCR ML GOOGLE SHEET / CSV HEADERS - NIFTY ATM +/-3 OPTION CHAIN
 # ==========================================================
-PCR_ML_HEADERS = [
-    "TIME", "NIFTY", "INDIA_VIX", "VIX_CHANGE",
+# This recorder creates ONE ROW per minute.
+# It records NIFTY + PCR summary + full CE/PE option-chain data for ATM-3 to ATM+3 strikes.
+OPTION_CHAIN_OFFSETS = [-3, -2, -1, 0, 1, 2, 3]
+OPTION_CHAIN_FIELDS = [
+    "STRIKE", "CE_SYMBOL", "CE_TOKEN", "CE_LTP", "CE_OPEN", "CE_HIGH", "CE_LOW", "CE_CLOSE",
+    "CE_AVG_PRICE", "CE_VOLUME", "CE_OI", "CE_OI_CHANGE", "CE_LAST_TRADE_QTY",
+    "CE_NET_CHANGE", "CE_PERCENT_CHANGE", "CE_BID_PRICE", "CE_BID_QTY", "CE_ASK_PRICE", "CE_ASK_QTY",
+    "CE_TOTAL_BUY_QTY", "CE_TOTAL_SELL_QTY", "CE_IV", "CE_DELTA", "CE_GAMMA", "CE_THETA", "CE_VEGA", "CE_RHO",
+    "PE_SYMBOL", "PE_TOKEN", "PE_LTP", "PE_OPEN", "PE_HIGH", "PE_LOW", "PE_CLOSE",
+    "PE_AVG_PRICE", "PE_VOLUME", "PE_OI", "PE_OI_CHANGE", "PE_LAST_TRADE_QTY",
+    "PE_NET_CHANGE", "PE_PERCENT_CHANGE", "PE_BID_PRICE", "PE_BID_QTY", "PE_ASK_PRICE", "PE_ASK_QTY",
+    "PE_TOTAL_BUY_QTY", "PE_TOTAL_SELL_QTY", "PE_IV", "PE_DELTA", "PE_GAMMA", "PE_THETA", "PE_VEGA", "PE_RHO",
+    "STRIKE_PCR_OI", "STRIKE_PCR_VOLUME", "STRIKE_CE_PE_LTP_DIFF", "STRIKE_TOTAL_OI", "STRIKE_TOTAL_VOLUME"
+]
+
+PCR_ML_BASE_HEADERS = [
+    "TIME", "NIFTY", "INDIA_VIX", "VIX_CHANGE", "EXPIRY", "ATM_STRIKE",
     "PCR_OI", "PCR_VOLUME", "ATM_PCR",
     "TOTAL_CE_OI", "TOTAL_PE_OI", "CE_OI_CHANGE", "PE_OI_CHANGE", "OI_DIFFERENCE",
     "CE_VOLUME", "PE_VOLUME", "CE_VOLUME_CHANGE", "PE_VOLUME_CHANGE", "VOLUME_DELTA",
     "MAX_PAIN", "DISTANCE_MAX_PAIN",
     "MAX_CE_OI_STRIKE", "MAX_PE_OI_STRIKE", "CE_STRIKE_SHIFT", "PE_STRIKE_SHIFT",
     "VWAP", "VWAP_DISTANCE",
-    "DAYS_TO_EXPIRY",
-    "IS_EXPIRY_DAY", "IS_PRE_EXPIRY_DAY", "IS_POST_EXPIRY_DAY", "EXPIRY_TYPE",
+    "DAYS_TO_EXPIRY", "IS_EXPIRY_DAY", "IS_PRE_EXPIRY_DAY", "IS_POST_EXPIRY_DAY", "EXPIRY_TYPE",
     "TIME_BLOCK", "MARKET_DIRECTION",
     "NIFTY_CHANGE_1MIN", "NIFTY_CHANGE_5MIN", "NIFTY_CHANGE_15MIN",
-    "ATM_CE_LTP", "ATM_PE_LTP", "ATM_CE_IV", "ATM_PE_IV",
-    "ATM_CE_DELTA", "ATM_CE_GAMMA", "ATM_CE_THETA", "ATM_CE_VEGA", "ATM_CE_RHO",
-    "ATM_PE_DELTA", "ATM_PE_GAMMA", "ATM_PE_THETA", "ATM_PE_VEGA", "ATM_PE_RHO",
     "FUTURE_MOVE_15MIN", "FUTURE_MOVE_30MIN", "FUTURE_MOVE_60MIN",
     "ML_SIGNAL", "CREATED_AT"
+]
+
+PCR_ML_HEADERS = PCR_ML_BASE_HEADERS + [
+    f"S{offset:+d}_{field}" for offset in OPTION_CHAIN_OFFSETS for field in OPTION_CHAIN_FIELDS
 ]
 
 # ==========================================================
@@ -760,10 +775,79 @@ def get_market_direction(nifty_change_1min, nifty_change_5min, nifty_change_15mi
     return "MIXED"
 
 
+def get_best_depth_price_qty(opt, side):
+    """Return best bid/ask price and qty from Angel FULL market depth."""
+    try:
+        depth = opt.get("depth", {}) if isinstance(opt, dict) else {}
+        rows = depth.get(side, []) if isinstance(depth, dict) else []
+        if rows and isinstance(rows[0], dict):
+            return safe_float(rows[0].get("price", 0)), int(safe_float(rows[0].get("quantity", 0)))
+    except Exception:
+        pass
+    return 0.0, 0
+
+
+def enrich_option_row(row, prefix, opt, nifty, strike, days_to_expiry, previous):
+    """Add CE or PE option data + calculated IV/Greeks to one wide CSV row."""
+    try:
+        opt = opt or {}
+        symbol = opt.get("symbol", "")
+        token = opt.get("token", "")
+        ltp = safe_float(opt.get("ltp", 0))
+        oi = int(safe_float(opt.get("oi", 0)))
+        volume = int(safe_float(opt.get("volume", 0)))
+        prev_oi = safe_float(previous.get(f"{prefix}_OI", 0))
+        oi_change = int(oi - prev_oi) if prev_oi else 0
+
+        bid_price, bid_qty = get_best_depth_price_qty(opt, "buy")
+        ask_price, ask_qty = get_best_depth_price_qty(opt, "sell")
+
+        option_type = "CE" if prefix.endswith("CE") else "PE"
+        risk_free_rate = 0.06
+        greeks_days = days_to_expiry if isinstance(days_to_expiry, int) and days_to_expiry >= 0 else 1
+        time_years = max(float(greeks_days), 1) / 365.0
+        iv = implied_volatility(ltp, float(nifty), float(strike), time_years, risk_free_rate, option_type) if strike else 0
+        greeks = calculate_option_greeks(float(nifty), float(strike), greeks_days, risk_free_rate, iv, option_type) if strike else {"delta":0,"gamma":0,"theta":0,"vega":0,"rho":0}
+
+        row[f"{prefix}_SYMBOL"] = symbol
+        row[f"{prefix}_TOKEN"] = token
+        row[f"{prefix}_LTP"] = round(ltp, 2)
+        row[f"{prefix}_OPEN"] = round(safe_float(opt.get("open", 0)), 2)
+        row[f"{prefix}_HIGH"] = round(safe_float(opt.get("high", 0)), 2)
+        row[f"{prefix}_LOW"] = round(safe_float(opt.get("low", 0)), 2)
+        row[f"{prefix}_CLOSE"] = round(safe_float(opt.get("close", 0)), 2)
+        row[f"{prefix}_AVG_PRICE"] = round(safe_float(opt.get("avgPrice", 0)), 2)
+        row[f"{prefix}_VOLUME"] = volume
+        row[f"{prefix}_OI"] = oi
+        row[f"{prefix}_OI_CHANGE"] = oi_change
+        row[f"{prefix}_LAST_TRADE_QTY"] = int(safe_float(opt.get("lastTradeQty", 0)))
+        row[f"{prefix}_NET_CHANGE"] = round(safe_float(opt.get("netChange", 0)), 2)
+        row[f"{prefix}_PERCENT_CHANGE"] = round(safe_float(opt.get("percentChange", 0)), 2)
+        row[f"{prefix}_BID_PRICE"] = round(bid_price, 2)
+        row[f"{prefix}_BID_QTY"] = bid_qty
+        row[f"{prefix}_ASK_PRICE"] = round(ask_price, 2)
+        row[f"{prefix}_ASK_QTY"] = ask_qty
+        row[f"{prefix}_TOTAL_BUY_QTY"] = int(safe_float(opt.get("totBuyQuan", 0)))
+        row[f"{prefix}_TOTAL_SELL_QTY"] = int(safe_float(opt.get("totSellQuan", 0)))
+        row[f"{prefix}_IV"] = iv
+        row[f"{prefix}_DELTA"] = greeks.get("delta", 0)
+        row[f"{prefix}_GAMMA"] = greeks.get("gamma", 0)
+        row[f"{prefix}_THETA"] = greeks.get("theta", 0)
+        row[f"{prefix}_VEGA"] = greeks.get("vega", 0)
+        row[f"{prefix}_RHO"] = greeks.get("rho", 0)
+
+        return {"ltp": ltp, "oi": oi, "volume": volume, "iv": iv, "greeks": greeks}
+    except Exception as e:
+        print(f"Option row enrich error {prefix}:", e)
+        log_error(str(e))
+        return {"ltp": 0, "oi": 0, "volume": 0, "iv": 0, "greeks": {}}
+
+
 def build_pcr_ml_snapshot(symbols, context, nifty, now):
     previous = previous_pcr_ml_snapshot or {}
 
     option_by_token = context.get("option_by_token", {})
+    token_by_strike_type = context.get("token_by_strike_type", {})
     strike_agg = {}
 
     total_ce_oi = 0
@@ -824,27 +908,11 @@ def build_pcr_ml_snapshot(symbols, context, nifty, now):
     days_to_expiry = (expiry_date - now.date()).days if expiry_date else ""
     is_expiry_day, is_pre_expiry_day, is_post_expiry_day, expiry_type = get_expiry_features(expiry_date, now)
 
-    # ATM option Greeks are calculated from ATM CE/PE LTP using Black-Scholes.
-    # If broker/API gives no IV directly, IV is reverse-calculated from premium.
-    atm_strike = float(context.get("atm", 0) or 0)
-    atm_ce_data = option_by_token.get(context.get("atm_ce_token"), {})
-    atm_pe_data = option_by_token.get(context.get("atm_pe_token"), {})
-    atm_ce_ltp = safe_float(atm_ce_data.get("ltp", 0))
-    atm_pe_ltp = safe_float(atm_pe_data.get("ltp", 0))
-    risk_free_rate = 0.06
-    greeks_days = days_to_expiry if isinstance(days_to_expiry, int) and days_to_expiry >= 0 else 1
-    time_years = max(float(greeks_days), 1) / 365.0
-    atm_ce_iv = implied_volatility(atm_ce_ltp, float(nifty), atm_strike, time_years, risk_free_rate, "CE") if atm_strike else 0
-    atm_pe_iv = implied_volatility(atm_pe_ltp, float(nifty), atm_strike, time_years, risk_free_rate, "PE") if atm_strike else 0
-    atm_ce_greeks = calculate_option_greeks(float(nifty), atm_strike, greeks_days, risk_free_rate, atm_ce_iv, "CE") if atm_strike else {"delta":0,"gamma":0,"theta":0,"vega":0,"rho":0}
-    atm_pe_greeks = calculate_option_greeks(float(nifty), atm_strike, greeks_days, risk_free_rate, atm_pe_iv, "PE") if atm_strike else {"delta":0,"gamma":0,"theta":0,"vega":0,"rho":0}
-
     nifty_change_1min = get_snapshot_nifty_change(1, nifty)
     nifty_change_5min = get_snapshot_nifty_change(5, nifty)
     nifty_change_15min = get_snapshot_nifty_change(15, nifty)
     market_direction = get_market_direction(nifty_change_1min, nifty_change_5min, nifty_change_15min)
 
-    # Basic placeholder ML signal. Actual trained ML model will replace this after enough history.
     if pcr_oi > 1.2 and pe_oi_change > ce_oi_change and vix_change <= 0:
         ml_signal = "BULLISH_BIAS"
     elif pcr_oi < 0.8 and ce_oi_change > pe_oi_change and vix_change >= 0:
@@ -852,11 +920,15 @@ def build_pcr_ml_snapshot(symbols, context, nifty, now):
     else:
         ml_signal = "DATA_COLLECTION"
 
-    return {
+    atm_strike = int(float(context.get("atm", 0) or 0))
+
+    snapshot = {
         "TIME": now.strftime("%Y-%m-%d %H:%M:%S"),
         "NIFTY": round(float(nifty), 2),
         "INDIA_VIX": india_vix,
         "VIX_CHANGE": vix_change,
+        "EXPIRY": context.get("expiry", ""),
+        "ATM_STRIKE": atm_strike,
         "PCR_OI": pcr_oi,
         "PCR_VOLUME": pcr_volume,
         "ATM_PCR": round(float(context.get("atm_pcr", 0) or 0), 4),
@@ -888,20 +960,6 @@ def build_pcr_ml_snapshot(symbols, context, nifty, now):
         "NIFTY_CHANGE_1MIN": nifty_change_1min,
         "NIFTY_CHANGE_5MIN": nifty_change_5min,
         "NIFTY_CHANGE_15MIN": nifty_change_15min,
-        "ATM_CE_LTP": round(atm_ce_ltp, 2),
-        "ATM_PE_LTP": round(atm_pe_ltp, 2),
-        "ATM_CE_IV": atm_ce_iv,
-        "ATM_PE_IV": atm_pe_iv,
-        "ATM_CE_DELTA": atm_ce_greeks.get("delta", 0),
-        "ATM_CE_GAMMA": atm_ce_greeks.get("gamma", 0),
-        "ATM_CE_THETA": atm_ce_greeks.get("theta", 0),
-        "ATM_CE_VEGA": atm_ce_greeks.get("vega", 0),
-        "ATM_CE_RHO": atm_ce_greeks.get("rho", 0),
-        "ATM_PE_DELTA": atm_pe_greeks.get("delta", 0),
-        "ATM_PE_GAMMA": atm_pe_greeks.get("gamma", 0),
-        "ATM_PE_THETA": atm_pe_greeks.get("theta", 0),
-        "ATM_PE_VEGA": atm_pe_greeks.get("vega", 0),
-        "ATM_PE_RHO": atm_pe_greeks.get("rho", 0),
         "FUTURE_MOVE_15MIN": "",
         "FUTURE_MOVE_30MIN": "",
         "FUTURE_MOVE_60MIN": "",
@@ -909,11 +967,40 @@ def build_pcr_ml_snapshot(symbols, context, nifty, now):
         "CREATED_AT": ist_now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
+    # Add ATM-3 to ATM+3 option chain data, both CE and PE.
+    for offset in OPTION_CHAIN_OFFSETS:
+        strike = atm_strike + (offset * 50)
+        section = f"S{offset:+d}"
+        snapshot[f"{section}_STRIKE"] = strike
+
+        ce_token = token_by_strike_type.get((strike, "CE"))
+        pe_token = token_by_strike_type.get((strike, "PE"))
+        ce_opt = option_by_token.get(ce_token, {}) if ce_token else {}
+        pe_opt = option_by_token.get(pe_token, {}) if pe_token else {}
+
+        ce_metrics = enrich_option_row(snapshot, f"{section}_CE", ce_opt, nifty, strike, days_to_expiry, previous)
+        pe_metrics = enrich_option_row(snapshot, f"{section}_PE", pe_opt, nifty, strike, days_to_expiry, previous)
+
+        ce_oi = ce_metrics.get("oi", 0)
+        pe_oi = pe_metrics.get("oi", 0)
+        ce_vol = ce_metrics.get("volume", 0)
+        pe_vol = pe_metrics.get("volume", 0)
+        ce_ltp = ce_metrics.get("ltp", 0)
+        pe_ltp = pe_metrics.get("ltp", 0)
+
+        snapshot[f"{section}_STRIKE_PCR_OI"] = round(pe_oi / ce_oi, 4) if ce_oi else 0
+        snapshot[f"{section}_STRIKE_PCR_VOLUME"] = round(pe_vol / ce_vol, 4) if ce_vol else 0
+        snapshot[f"{section}_STRIKE_CE_PE_LTP_DIFF"] = round(ce_ltp - pe_ltp, 2)
+        snapshot[f"{section}_STRIKE_TOTAL_OI"] = ce_oi + pe_oi
+        snapshot[f"{section}_STRIKE_TOTAL_VOLUME"] = ce_vol + pe_vol
+
+    return snapshot
+
 
 def save_pcr_ml_snapshot(symbols, context, nifty, now):
     """
-    Saves one PCR ML row per minute during live market.
-    Sends Telegram only every 2 hours.
+    Saves one PCR ML option-chain row per minute during live market.
+    Records NIFTY ATM +/-3 strikes with CE/PE LTP, OI, volume, IV and Greeks.
     """
     global last_pcr_ml_save_minute, last_pcr_ml_alert_hour, previous_pcr_ml_snapshot, pcr_ml_snapshots
 
@@ -925,7 +1012,6 @@ def save_pcr_ml_snapshot(symbols, context, nifty, now):
         snapshot = build_pcr_ml_snapshot(symbols, context, nifty, now)
         row = [snapshot.get(h, "") for h in PCR_ML_HEADERS]
 
-        # Save CSV
         file_exists = os.path.exists(PCR_ML_FILE)
         with open(PCR_ML_FILE, "a", newline="") as f:
             writer = csv.writer(f)
@@ -933,7 +1019,6 @@ def save_pcr_ml_snapshot(symbols, context, nifty, now):
                 writer.writerow(PCR_ML_HEADERS)
             writer.writerow(row)
 
-        # Save Google Sheet tab
         if pcr_ml_sheet is not None:
             pcr_ml_sheet.append_row(row, value_input_option="USER_ENTERED")
         else:
@@ -946,43 +1031,38 @@ def save_pcr_ml_snapshot(symbols, context, nifty, now):
 
         last_pcr_ml_save_minute = minute_key
 
-        # Backup ML/Greeks CSV to GitHub every configured interval, default 30 minutes.
         upload_any_csv_to_github(
             PCR_ML_FILE,
             GITHUB_PCR_ML_PATH,
-            "PCR ML + ATM GREEKS HISTORY",
+            "PCR ML ATM +/-3 OPTION CHAIN HISTORY",
             force=False,
             last_sync_name="last_github_pcr_ml_sync_time"
         )
 
+        atm_key = "S+0"
         print(
-            "PCR ML SNAPSHOT SAVED |",
+            "PCR ML OPTION CHAIN SAVED |",
             snapshot["TIME"],
             "| NIFTY:", snapshot["NIFTY"],
-            "| PCR:", snapshot["PCR_OI"],
-            "| ATM PCR:", snapshot["ATM_PCR"],
-            "| VIX:", snapshot["INDIA_VIX"],
-            "| MAX PAIN:", snapshot["MAX_PAIN"]
+            "| EXP:", snapshot["EXPIRY"],
+            "| ATM:", snapshot["ATM_STRIKE"],
+            "| ATM CE LTP:", snapshot.get(f"{atm_key}_CE_LTP"),
+            "| ATM PE LTP:", snapshot.get(f"{atm_key}_PE_LTP"),
+            "| ATM CE DELTA:", snapshot.get(f"{atm_key}_CE_DELTA"),
+            "| ATM PE DELTA:", snapshot.get(f"{atm_key}_PE_DELTA")
         )
 
-        # Telegram health alert every 2 hours only
-        if now.hour % 2 == 0 and last_pcr_ml_alert_hour != now.hour:
+        # One-line Telegram confirmation only once per hour to avoid spam.
+        if last_pcr_ml_alert_hour != now.hour:
             send_telegram(
-                "📊 PCR ML DATA RECORDING ACTIVE\n"
-                f"Time: {snapshot['TIME']}\n"
-                f"NIFTY: {snapshot['NIFTY']}\n"
-                f"India VIX: {snapshot['INDIA_VIX']} | Change: {snapshot['VIX_CHANGE']}\n"
-                f"PCR OI: {snapshot['PCR_OI']} | ATM PCR: {snapshot['ATM_PCR']}\n"
-                f"Max Pain: {snapshot['MAX_PAIN']} | Distance: {snapshot['DISTANCE_MAX_PAIN']}\n"
-                f"Market Direction: {snapshot['MARKET_DIRECTION']}\n"
-                f"ML Status: {snapshot['ML_SIGNAL']}"
+                f"✅ PCR ML OPTION DATA RECORDED | ATM±3 | {snapshot['TIME']} | NIFTY {snapshot['NIFTY']} | ATM {snapshot['ATM_STRIKE']}"
             )
             last_pcr_ml_alert_hour = now.hour
 
     except Exception as e:
-        print("PCR ML Snapshot Save Error:", e)
+        print("PCR ML Option Chain Save Error:", e)
         log_error(str(e))
-        send_telegram(f"❌ PCR ML SNAPSHOT ERROR\n{e}")
+        send_telegram(f"❌ PCR ML OPTION CHAIN ERROR\n{e}")
 
 # ==========================================================
 # ACTIVE TRADE RECOVERY
@@ -2525,7 +2605,18 @@ def get_option_context(symbols, now, nifty):
                 "type": opt_type,
                 "oi": 0,
                 "volume": 0,
-                "ltp": 0
+                "ltp": 0,
+                "open": 0,
+                "high": 0,
+                "low": 0,
+                "close": 0,
+                "avgPrice": 0,
+                "lastTradeQty": 0,
+                "netChange": 0,
+                "percentChange": 0,
+                "totBuyQuan": 0,
+                "totSellQuan": 0,
+                "depth": {}
             }
             token_by_strike_type[(strike, opt_type)] = o["token"]
 
@@ -2575,6 +2666,17 @@ def get_option_context(symbols, now, nifty):
                 option_by_token[tk]["ltp"] = float(ltp)
             except Exception:
                 option_by_token[tk]["ltp"] = 0
+            option_by_token[tk]["open"] = safe_float(item.get("open", 0))
+            option_by_token[tk]["high"] = safe_float(item.get("high", 0))
+            option_by_token[tk]["low"] = safe_float(item.get("low", 0))
+            option_by_token[tk]["close"] = safe_float(item.get("close", 0))
+            option_by_token[tk]["avgPrice"] = safe_float(item.get("avgPrice", 0))
+            option_by_token[tk]["lastTradeQty"] = safe_float(item.get("lastTradeQty", 0))
+            option_by_token[tk]["netChange"] = safe_float(item.get("netChange", 0))
+            option_by_token[tk]["percentChange"] = safe_float(item.get("percentChange", 0))
+            option_by_token[tk]["totBuyQuan"] = safe_float(item.get("totBuyQuan", 0))
+            option_by_token[tk]["totSellQuan"] = safe_float(item.get("totSellQuan", 0))
+            option_by_token[tk]["depth"] = item.get("depth", {}) or {}
         if strike is None:
             continue
 
