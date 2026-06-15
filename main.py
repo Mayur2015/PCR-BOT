@@ -492,7 +492,7 @@ def init_google_sheet():
             try:
                 existing_header = pcr_ml_sheet.row_values(1)
                 if existing_header != PCR_ML_HEADERS:
-                    pcr_ml_sheet.update("A1", [PCR_ML_HEADERS], value_input_option="USER_ENTERED")
+                    pcr_ml_sheet.update("A1", [PCR_ML_HEADERS], value_input_option="RAW")
                     print("PCR_ML_DATA header updated with latest ML columns")
             except Exception as header_error:
                 print("PCR_ML_DATA header update warning:", header_error)
