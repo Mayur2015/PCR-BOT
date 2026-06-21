@@ -3670,6 +3670,854 @@ def check_hybrid_exit(trade, current_price, nifty, prefix="HYBRID"):
 
     return None, None
 
+
+
+# ==========================================================
+# MULTI TIMEFRAME STRATEGY LAB HELPERS
+# ==========================================================
+# Freeze note: This section is only for paper-trade strategy timeframe testing.
+# It does NOT modify PCR_ML_HEADERS, PCR_ML_DATA, build_pcr_ml_snapshot(),
+# save_pcr_ml_snapshot(), option-chain recorder, Google Sheet ML tab, or PCR ML GitHub backup.
+TF_LIST = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 40, 45, 50, 60]
+TF_SIGNAL_KEYS = {}
+TF_LAST_ENTRY_TIME = {}
+
+
+def tf_name(base_name, tf):
+    return f"{base_name}_TF{int(tf)}"
+
+
+def extract_tf(strategy_name):
+    try:
+        if "_TF" not in str(strategy_name):
+            return None
+        return int(str(strategy_name).split("_TF")[-1])
+    except Exception:
+        return None
+
+
+def is_tf_strategy(strategy_name):
+    return extract_tf(strategy_name) is not None
+
+
+def tf_entry_cooldown_ok(strategy_name, now, seconds):
+    last_time = TF_LAST_ENTRY_TIME.get(strategy_name)
+    if last_time is None:
+        return True
+    try:
+        return (now - last_time).total_seconds() >= seconds
+    except Exception:
+        return True
+
+
+def set_tf_entry_time(strategy_name, now):
+    TF_LAST_ENTRY_TIME[strategy_name] = now
+
+
+def get_tf_working_candles(tf):
+    candles = get_all_working_candles()
+    if int(tf) <= 1:
+        return candles
+    return aggregate_candles(candles, int(tf))
+
+
+def get_tf_completed_candles(tf):
+    if int(tf) <= 1:
+        return list(nifty_candles)
+    return aggregate_candles(list(nifty_candles), int(tf))
+
+
+def get_tf_signal_key(strategy_name, key):
+    return TF_SIGNAL_KEYS.get(strategy_name) == key
+
+
+def set_tf_signal_key(strategy_name, key):
+    TF_SIGNAL_KEYS[strategy_name] = key
+
+
+# -------------------------- ADX TF --------------------------
+def get_adx_signal_tf(nifty, tf):
+    if not ADX_ENABLED:
+        return None, None
+    candles = get_tf_working_candles(tf)
+    if len(candles) < ADX_MIN_CANDLES_REQUIRED:
+        return None, None
+    values = calculate_adx_values(candles, ADX_PERIOD)
+    if not values:
+        return None, None
+    latest = values[-1]
+    adx = latest["adx"]
+    plus_di = latest["plus_di"]
+    minus_di = latest["minus_di"]
+    if adx < ADX_MIN_VALUE:
+        return None, None
+    if ADX_VWAP_FILTER and current_vwap is None:
+        return None, None
+    above_vwap = True if not ADX_VWAP_FILTER else float(nifty) > float(current_vwap)
+    below_vwap = True if not ADX_VWAP_FILTER else float(nifty) < float(current_vwap)
+    if plus_di > minus_di and above_vwap:
+        return "BUY CE", f"ADX_TF{tf} BUY CE: ADX {adx} > {ADX_MIN_VALUE}, +DI {plus_di} > -DI {minus_di}, NIFTY above VWAP {current_vwap}"
+    if minus_di > plus_di and below_vwap:
+        return "BUY PE", f"ADX_TF{tf} BUY PE: ADX {adx} > {ADX_MIN_VALUE}, -DI {minus_di} > +DI {plus_di}, NIFTY below VWAP {current_vwap}"
+    return None, None
+
+
+def check_adx_exit_tf(trade, current_price, nifty, tf):
+    if current_price is None:
+        return None, None
+    entry_price = float(trade["entry_price"])
+    profit_percent = round(((float(current_price) - entry_price) / entry_price) * 100, 2)
+    if profit_percent <= -ADX_STOPLOSS_PERCENT:
+        return f"ADX_TF{tf} STOPLOSS HIT", f"OPTION LOSS {profit_percent}%"
+    if profit_percent >= ADX_TARGET_PERCENT:
+        return f"ADX_TF{tf} TARGET HIT", f"OPTION PROFIT {profit_percent}%"
+    if profit_percent >= ADX_BREAKEVEN_PERCENT and not trade.get("breakeven_active"):
+        trade["breakeven_active"] = True
+        trade["breakeven_price"] = entry_price
+        save_active_trades()
+    if trade.get("breakeven_active") and float(current_price) <= float(trade.get("breakeven_price", entry_price)):
+        return f"ADX_TF{tf} BREAKEVEN EXIT", f"PROFIT LOCKED THEN BACK TO ENTRY, CURRENT PROFIT {profit_percent}%"
+    candles = get_tf_working_candles(tf)
+    values = calculate_adx_values(candles, ADX_PERIOD)
+    if not values:
+        return None, None
+    latest = values[-1]
+    adx = latest["adx"]
+    plus_di = latest["plus_di"]
+    minus_di = latest["minus_di"]
+    if trade["trade_type"] == "BUY CE":
+        if plus_di < minus_di:
+            return f"ADX_TF{tf} CE DI REVERSAL EXIT", f"+DI {plus_di} < -DI {minus_di}"
+        if current_vwap is not None and float(nifty) < float(current_vwap):
+            return f"ADX_TF{tf} CE VWAP EXIT", f"NIFTY {round(float(nifty), 2)} below VWAP {current_vwap}"
+    elif trade["trade_type"] == "BUY PE":
+        if minus_di < plus_di:
+            return f"ADX_TF{tf} PE DI REVERSAL EXIT", f"-DI {minus_di} < +DI {plus_di}"
+        if current_vwap is not None and float(nifty) > float(current_vwap):
+            return f"ADX_TF{tf} PE VWAP EXIT", f"NIFTY {round(float(nifty), 2)} above VWAP {current_vwap}"
+    if is_adx_falling(values, ADX_FALL_EXIT_CANDLES):
+        return f"ADX_TF{tf} WEAKENING EXIT", f"ADX falling for {ADX_FALL_EXIT_CANDLES} candles, latest ADX {adx}"
+    return None, None
+
+
+# -------------------------- RSI/STOCH/EMA TF --------------------------
+def get_latest_rsi_stoch_ema_state_tf(tf):
+    candles = get_tf_working_candles(tf)
+    if len(candles) < RSI_STOCH_MIN_CANDLES_REQUIRED:
+        return None
+    closes = [float(c["close"]) for c in candles]
+    ema25 = calculate_ema_series(closes, EMA_FAST_PERIOD)
+    ema75 = calculate_ema_series(closes, EMA_MID_PERIOD)
+    ema140 = calculate_ema_series(closes, EMA_SLOW_PERIOD)
+    rsi_values = calculate_rsi_series(closes, RSI_PERIOD)
+    stoch_values = calculate_stochastic_values(candles, STOCH_K_PERIOD, STOCH_K_SMOOTH, STOCH_D_PERIOD)
+    if not ema25 or not ema75 or not ema140 or len(rsi_values) < 2 or len(stoch_values) < 2:
+        return None
+    return {
+        "ema25": round(ema25[-1], 2),
+        "ema75": round(ema75[-1], 2),
+        "ema140": round(ema140[-1], 2),
+        "rsi": round(rsi_values[-1], 2),
+        "prev_rsi": round(rsi_values[-2], 2),
+        "stoch_k": round(stoch_values[-1]["k"], 2),
+        "stoch_d": round(stoch_values[-1]["d"], 2),
+        "prev_stoch_k": round(stoch_values[-2]["k"], 2),
+        "prev_stoch_d": round(stoch_values[-2]["d"], 2),
+        "close": round(closes[-1], 2),
+        "minute": candles[-1].get("minute", "")
+    }
+
+
+def get_rsi_stoch_ema_signal_tf(nifty, now, tf):
+    if not RSI_STOCH_EMA_ENABLED or not rsi_stoch_entry_time_ok(now):
+        return None, None
+    state = get_latest_rsi_stoch_ema_state_tf(tf)
+    if state is None:
+        return None, None
+    price = float(nifty)
+    ema25, ema75, ema140 = state["ema25"], state["ema75"], state["ema140"]
+    rsi = state["rsi"]
+    k, d = state["stoch_k"], state["stoch_d"]
+    prev_k, prev_d = state["prev_stoch_k"], state["prev_stoch_d"]
+    bullish_ema = ema25 > ema75 > ema140
+    bearish_ema = ema25 < ema75 < ema140
+    bullish_cross = prev_k <= prev_d and k > d
+    bearish_cross = prev_k >= prev_d and k < d
+    above_vwap = True
+    below_vwap = True
+    if RSI_STOCH_USE_VWAP_FILTER:
+        if current_vwap is None:
+            return None, None
+        above_vwap = price > float(current_vwap)
+        below_vwap = price < float(current_vwap)
+    if bullish_ema and price > ema25 and rsi >= RSI_BULL_LEVEL and bullish_cross and k <= STOCH_CE_MAX_LEVEL and above_vwap:
+        return "BUY CE", f"RSI_STOCH_EMA_TF{tf} BUY CE: EMA25>{EMA_MID_PERIOD}>{EMA_SLOW_PERIOD}, RSI {rsi}, Stoch K {k} crossed above D {d}, candle {state['minute']}"
+    if bearish_ema and price < ema25 and rsi <= RSI_BEAR_LEVEL and bearish_cross and k >= STOCH_PE_MIN_LEVEL and below_vwap:
+        return "BUY PE", f"RSI_STOCH_EMA_TF{tf} BUY PE: EMA25<EMA75<EMA140, RSI {rsi}, Stoch K {k} crossed below D {d}, candle {state['minute']}"
+    return None, None
+
+
+def check_rsi_stoch_ema_exit_tf(trade, nifty, tf):
+    state = get_latest_rsi_stoch_ema_state_tf(tf)
+    if state is None:
+        return None, None
+    price = float(nifty)
+    ema25 = state["ema25"]
+    ema75 = state["ema75"]
+    rsi = state["rsi"]
+    k = state["stoch_k"]
+    d = state["stoch_d"]
+    prev_k = state["prev_stoch_k"]
+    prev_d = state["prev_stoch_d"]
+    bearish_cross = prev_k >= prev_d and k < d
+    bullish_cross = prev_k <= prev_d and k > d
+    if trade["trade_type"] == "BUY CE":
+        if rsi < 50:
+            return f"RSI_STOCH_EMA_TF{tf} CE RSI EXIT", f"RSI {rsi} below 50"
+        if bearish_cross:
+            return f"RSI_STOCH_EMA_TF{tf} CE STOCH REVERSAL", f"Stoch K {k} crossed below D {d}"
+        if price < ema25:
+            return f"RSI_STOCH_EMA_TF{tf} CE EMA EXIT", f"NIFTY {round(price, 2)} below EMA25 {ema25}"
+        if ema25 < ema75:
+            return f"RSI_STOCH_EMA_TF{tf} CE TREND EXIT", f"EMA25 {ema25} below EMA75 {ema75}"
+    elif trade["trade_type"] == "BUY PE":
+        if rsi > 50:
+            return f"RSI_STOCH_EMA_TF{tf} PE RSI EXIT", f"RSI {rsi} above 50"
+        if bullish_cross:
+            return f"RSI_STOCH_EMA_TF{tf} PE STOCH REVERSAL", f"Stoch K {k} crossed above D {d}"
+        if price > ema25:
+            return f"RSI_STOCH_EMA_TF{tf} PE EMA EXIT", f"NIFTY {round(price, 2)} above EMA25 {ema25}"
+        if ema25 > ema75:
+            return f"RSI_STOCH_EMA_TF{tf} PE TREND EXIT", f"EMA25 {ema25} above EMA75 {ema75}"
+    return None, None
+
+
+# -------------------------- MARKET STRUCTURE TF --------------------------
+def get_market_structure_signal_tf(nifty, tf):
+    strategy_name = tf_name(MARKET_STRUCTURE_NAME, tf)
+    if not MARKET_STRUCTURE_ENABLED:
+        return None, None
+    completed = get_tf_completed_candles(tf)
+    working = get_tf_working_candles(tf)
+    if not working or len(completed) < MS_MIN_CANDLES_REQUIRED:
+        return None, None
+    highs, lows = find_market_structure_swings(completed, MS_ZIGZAG_LENGTH)
+    if not highs or not lows:
+        return None, None
+    last_high = highs[-1]
+    last_low = lows[-1]
+    swing_high = float(last_high["price"])
+    swing_low = float(last_low["price"])
+    structure_range = abs(swing_high - swing_low)
+    if structure_range <= 0:
+        return None, None
+    fib_points = structure_range * MS_FIB_FACTOR
+    bullish_break_level = swing_high + fib_points
+    bearish_break_level = swing_low - fib_points
+    candle = working[-1]
+    candle_open = float(candle["open"])
+    candle_close = float(nifty)
+    candle_body = abs(candle_close - candle_open)
+    bullish_body = candle_close > candle_open and candle_body >= MS_MIN_BODY_POINTS
+    bearish_body = candle_close < candle_open and candle_body >= MS_MIN_BODY_POINTS
+    if candle_close >= bullish_break_level and bullish_body:
+        key = f"CE_{last_high['index']}_{round(swing_high, 2)}_{working[-1].get('minute', '')}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY CE", f"MARKET_STRUCTURE_TF{tf} BUY CE: MSB above {round(swing_high, 2)} + Fib {round(fib_points, 2)}, NIFTY {round(candle_close, 2)}"
+    if candle_close <= bearish_break_level and bearish_body:
+        key = f"PE_{last_low['index']}_{round(swing_low, 2)}_{working[-1].get('minute', '')}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY PE", f"MARKET_STRUCTURE_TF{tf} BUY PE: MSB below {round(swing_low, 2)} - Fib {round(fib_points, 2)}, NIFTY {round(candle_close, 2)}"
+    return None, None
+
+
+# -------------------------- SUPER EMA TF --------------------------
+def get_latest_super_ema_state_tf(tf):
+    candles = get_tf_working_candles(tf)
+    if len(candles) < SUPER_EMA_MIN_CANDLES_REQUIRED:
+        return None
+    closes = [float(c["close"]) for c in candles]
+    ema_fast = calculate_ema_series(closes, SUPER_EMA_FAST_PERIOD)
+    ema_slow = calculate_ema_series(closes, SUPER_EMA_SLOW_PERIOD)
+    st_values = calculate_supertrend_values(candles, SUPER_EMA_ATR_PERIOD, SUPER_EMA_ATR_MULTIPLIER)
+    if len(ema_fast) < 2 or len(ema_slow) < 2 or len(st_values) < 2:
+        return None
+    return {
+        "ema_fast": round(ema_fast[-1], 2),
+        "ema_slow": round(ema_slow[-1], 2),
+        "prev_ema_fast": round(ema_fast[-2], 2),
+        "prev_ema_slow": round(ema_slow[-2], 2),
+        "supertrend": st_values[-1]["supertrend"],
+        "supertrend_direction": st_values[-1]["direction"],
+        "prev_supertrend_direction": st_values[-2]["direction"],
+        "close": round(closes[-1], 2),
+        "minute": candles[-1].get("minute", "")
+    }
+
+
+def get_super_ema_signal_tf(nifty, tf):
+    if not SUPER_EMA_ENABLED:
+        return None, None
+    state = get_latest_super_ema_state_tf(tf)
+    if state is None:
+        return None, None
+    if SUPER_EMA_ADX_FILTER:
+        adx_values = calculate_adx_values(get_tf_working_candles(tf), ADX_PERIOD)
+        if not adx_values or float(adx_values[-1].get("adx", 0)) < SUPER_EMA_MIN_ADX:
+            return None, None
+    price = float(nifty)
+    ema_fast, ema_slow = state["ema_fast"], state["ema_slow"]
+    prev_fast, prev_slow = state["prev_ema_fast"], state["prev_ema_slow"]
+    st = state["supertrend"]
+    st_dir = state["supertrend_direction"]
+    bullish_cross = prev_fast <= prev_slow and ema_fast > ema_slow
+    bearish_cross = prev_fast >= prev_slow and ema_fast < ema_slow
+    signal_key = f"{state['minute']}_{round(ema_fast, 2)}_{round(ema_slow, 2)}_{st_dir}"
+    if bullish_cross and st_dir == "GREEN" and price > ema_fast and price > ema_slow and price > st:
+        return "BUY CE", f"SUPER_EMA_TF{tf} BUY CE: EMA{SUPER_EMA_FAST_PERIOD} {ema_fast} crossed above EMA{SUPER_EMA_SLOW_PERIOD} {ema_slow}, ST GREEN {st}"
+    if bearish_cross and st_dir == "RED" and price < ema_fast and price < ema_slow and price < st:
+        return "BUY PE", f"SUPER_EMA_TF{tf} BUY PE: EMA{SUPER_EMA_FAST_PERIOD} {ema_fast} crossed below EMA{SUPER_EMA_SLOW_PERIOD} {ema_slow}, ST RED {st}"
+    return None, None
+
+
+def check_super_ema_exit_tf(trade, current_price, nifty, tf):
+    if current_price is None:
+        return None, None
+    profit_percent, trailing_sl = update_super_ema_trailing_sl(trade, current_price)
+    if float(current_price) <= float(trailing_sl):
+        return f"SUPER_EMA_TF{tf} TRAILING SL HIT", f"Option {round(float(current_price), 2)} <= Trail SL {trailing_sl}, P/L {profit_percent}%"
+    state = get_latest_super_ema_state_tf(tf)
+    if state is None:
+        return None, None
+    ema_fast, ema_slow = state["ema_fast"], state["ema_slow"]
+    st, st_dir = state["supertrend"], state["supertrend_direction"]
+    price = float(nifty)
+    if trade["trade_type"] == "BUY CE":
+        if ema_fast < ema_slow:
+            return f"SUPER_EMA_TF{tf} CE EMA REVERSAL EXIT", f"EMA{SUPER_EMA_FAST_PERIOD} {ema_fast} below EMA{SUPER_EMA_SLOW_PERIOD} {ema_slow}"
+        if st_dir == "RED" or price < st:
+            return f"SUPER_EMA_TF{tf} CE SUPERTREND EXIT", f"Supertrend {st_dir}, ST {st}, NIFTY {round(price, 2)}"
+    elif trade["trade_type"] == "BUY PE":
+        if ema_fast > ema_slow:
+            return f"SUPER_EMA_TF{tf} PE EMA REVERSAL EXIT", f"EMA{SUPER_EMA_FAST_PERIOD} {ema_fast} above EMA{SUPER_EMA_SLOW_PERIOD} {ema_slow}"
+        if st_dir == "GREEN" or price > st:
+            return f"SUPER_EMA_TF{tf} PE SUPERTREND EXIT", f"Supertrend {st_dir}, ST {st}, NIFTY {round(price, 2)}"
+    return None, None
+
+
+# -------------------------- SL HUNT TF --------------------------
+def get_sl_hunt_signal_tf(nifty, pcr_change_3min, atm_pcr_change_3min, tf):
+    strategy_name = tf_name(SL_HUNT_NAME, tf)
+    if not SL_HUNT_ENABLED:
+        return None, None
+    completed = get_tf_completed_candles(tf)
+    working = get_tf_working_candles(tf)
+    if not working or len(completed) < SL_HUNT_MIN_CANDLES_REQUIRED:
+        return None, None
+    recent = completed[-SL_HUNT_LOOKBACK_CANDLES:]
+    if len(recent) < SL_HUNT_LOOKBACK_CANDLES:
+        return None, None
+    recent_high = max(float(c["high"]) for c in recent)
+    recent_low = min(float(c["low"]) for c in recent)
+    candle = working[-1]
+    candle_open = float(candle["open"])
+    candle_high = float(candle["high"])
+    candle_low = float(candle["low"])
+    candle_close = float(nifty)
+    body = abs(candle_close - candle_open)
+    if body < SL_HUNT_MIN_BODY_POINTS:
+        return None, None
+    upper_wick = candle_high - max(candle_open, candle_close)
+    lower_wick = min(candle_open, candle_close) - candle_low
+    downside_sweep = candle_low <= recent_low - SL_HUNT_SWEEP_BUFFER_POINTS
+    upside_sweep = candle_high >= recent_high + SL_HUNT_SWEEP_BUFFER_POINTS
+    bullish_reclaim = candle_close >= recent_low + SL_HUNT_RECLAIM_BUFFER_POINTS and candle_close > candle_open
+    bearish_reclaim = candle_close <= recent_high - SL_HUNT_RECLAIM_BUFFER_POINTS and candle_close < candle_open
+    strong_lower_rejection = lower_wick >= body * SL_HUNT_MIN_WICK_RATIO
+    strong_upper_rejection = upper_wick >= body * SL_HUNT_MIN_WICK_RATIO
+    vwap_ce_ok = True
+    vwap_pe_ok = True
+    if SL_HUNT_USE_VWAP_FILTER:
+        if current_vwap is None:
+            return None, None
+        vwap_ce_ok = candle_close >= float(current_vwap) - 10
+        vwap_pe_ok = candle_close <= float(current_vwap) + 10
+    pcr_ce_ok = True
+    pcr_pe_ok = True
+    if SL_HUNT_USE_PCR_FILTER:
+        pcr_ce_ok = not (pcr_change_3min < -ENTRY_PCR_CHANGE or atm_pcr_change_3min < -ENTRY_ATM_PCR_CHANGE)
+        pcr_pe_ok = not (pcr_change_3min > ENTRY_PCR_CHANGE or atm_pcr_change_3min > ENTRY_ATM_PCR_CHANGE)
+    minute_key = candle.get("minute", "")
+    if downside_sweep and bullish_reclaim and strong_lower_rejection and vwap_ce_ok and pcr_ce_ok:
+        key = f"CE_{minute_key}_{round(recent_low, 2)}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY CE", f"SL_HUNT_TF{tf} BUY CE: downside sweep below {round(recent_low, 2)}, low {round(candle_low, 2)}, reclaim {round(candle_close, 2)}"
+    if upside_sweep and bearish_reclaim and strong_upper_rejection and vwap_pe_ok and pcr_pe_ok:
+        key = f"PE_{minute_key}_{round(recent_high, 2)}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY PE", f"SL_HUNT_TF{tf} BUY PE: upside sweep above {round(recent_high, 2)}, high {round(candle_high, 2)}, reject {round(candle_close, 2)}"
+    return None, None
+
+
+def check_sl_hunt_exit_tf(trade, current_price, nifty, tf):
+    if current_price is None:
+        return None, None
+    profit_percent, trailing_sl = update_sl_hunt_trade_protection(trade, current_price)
+    if float(current_price) <= float(trailing_sl):
+        return f"SL_HUNT_TF{tf} SL HIT", f"Option {round(float(current_price), 2)} <= SL {trailing_sl}, P/L {profit_percent}%"
+    if profit_percent >= SL_HUNT_TARGET_PERCENT:
+        return f"SL_HUNT_TF{tf} TARGET HIT", f"Option profit {profit_percent}%"
+    completed = get_tf_completed_candles(tf)
+    if len(completed) >= 1:
+        prev = completed[-1]
+        if trade["trade_type"] == "BUY CE" and float(nifty) < float(prev["low"]):
+            return f"SL_HUNT_TF{tf} CE REVERSAL FAILED", f"NIFTY {round(float(nifty), 2)} below previous TF candle low {round(float(prev['low']), 2)}"
+        if trade["trade_type"] == "BUY PE" and float(nifty) > float(prev["high"]):
+            return f"SL_HUNT_TF{tf} PE REVERSAL FAILED", f"NIFTY {round(float(nifty), 2)} above previous TF candle high {round(float(prev['high']), 2)}"
+    return None, None
+
+
+# -------------------------- EMA9/20 TF --------------------------
+def get_ema9_20_state_tf(tf):
+    if not EMA9_20_ENABLED:
+        return None
+    candles = get_tf_working_candles(tf)
+    min_candles = max(EMA9_20_MIN_3MIN_CANDLES, EMA9_20_SLOW + 5)
+    if len(candles) < min_candles:
+        return None
+    closes = [float(c["close"]) for c in candles]
+    ema_fast = calculate_ema_series(closes, EMA9_20_FAST)
+    ema_slow = calculate_ema_series(closes, EMA9_20_SLOW)
+    if len(ema_fast) < 2 or len(ema_slow) < 2:
+        return None
+    return {
+        "ema_fast": round(ema_fast[-1], 2),
+        "ema_slow": round(ema_slow[-1], 2),
+        "prev_ema_fast": round(ema_fast[-2], 2),
+        "prev_ema_slow": round(ema_slow[-2], 2),
+        "close": round(closes[-1], 2),
+        "minute": candles[-1].get("minute", "")
+    }
+
+
+def get_ema9_20_signal_tf(tf):
+    state = get_ema9_20_state_tf(tf)
+    if state is None:
+        return None, None
+    bullish_cross = state["prev_ema_fast"] <= state["prev_ema_slow"] and state["ema_fast"] > state["ema_slow"]
+    bearish_cross = state["prev_ema_fast"] >= state["prev_ema_slow"] and state["ema_fast"] < state["ema_slow"]
+    if bullish_cross:
+        return "BUY CE", f"EMA9_20_TF{tf} BUY CE: EMA9 {state['ema_fast']} crossed above EMA20 {state['ema_slow']} on TF{tf} candle {state['minute']}"
+    if bearish_cross:
+        return "BUY PE", f"EMA9_20_TF{tf} BUY PE: EMA9 {state['ema_fast']} crossed below EMA20 {state['ema_slow']} on TF{tf} candle {state['minute']}"
+    return None, None
+
+
+def check_ema9_20_exit_tf(trade, tf):
+    state = get_ema9_20_state_tf(tf)
+    if state is None:
+        return None, None
+    bullish_cross = state["prev_ema_fast"] <= state["prev_ema_slow"] and state["ema_fast"] > state["ema_slow"]
+    bearish_cross = state["prev_ema_fast"] >= state["prev_ema_slow"] and state["ema_fast"] < state["ema_slow"]
+    if trade["trade_type"] == "BUY CE" and bearish_cross:
+        return f"EMA9_20_TF{tf} OPPOSITE CROSS EXIT", f"EMA9 {state['ema_fast']} crossed below EMA20 {state['ema_slow']}"
+    if trade["trade_type"] == "BUY PE" and bullish_cross:
+        return f"EMA9_20_TF{tf} OPPOSITE CROSS EXIT", f"EMA9 {state['ema_fast']} crossed above EMA20 {state['ema_slow']}"
+    return None, None
+
+
+# -------------------------- EMA TRAIL TF --------------------------
+def get_ema_trail_state_tf(tf, period=9):
+    try:
+        candles = get_tf_working_candles(tf)
+        if len(candles) < period + 2:
+            return None
+        closes = [float(c["close"]) for c in candles]
+        ema_values = calculate_ema_series(closes, period)
+        if not ema_values:
+            return None
+        return {"ema": round(ema_values[-1], 2), "close": round(closes[-1], 2), "minute": candles[-1].get("minute", "")}
+    except Exception as e:
+        print("EMA trail TF state error:", e)
+        log_error(str(e))
+        return None
+
+
+def check_ema9_trail_exit_tf(trade, current_price, nifty, tf, prefix="EMA9 TRAIL"):
+    exit_reason, exit_trigger = check_fixed_sl_target_exit(trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=999999, prefix=prefix)
+    if exit_reason:
+        return exit_reason, exit_trigger
+    state = get_ema_trail_state_tf(tf, LAB_EMA_TRAIL_PERIOD)
+    if state is None:
+        return None, None
+    price = float(nifty)
+    ema9 = float(state["ema"])
+    if trade["trade_type"] == "BUY CE" and price < ema9:
+        return f"{prefix} CE EMA9 EXIT", f"NIFTY {round(price, 2)} closed below TF{tf} EMA9 {ema9}"
+    if trade["trade_type"] == "BUY PE" and price > ema9:
+        return f"{prefix} PE EMA9 EXIT", f"NIFTY {round(price, 2)} closed above TF{tf} EMA9 {ema9}"
+    return None, None
+
+
+def check_hybrid_exit_tf(trade, current_price, nifty, tf, prefix="HYBRID"):
+    try:
+        entry_price = float(trade["entry_price"])
+        current_price = float(current_price)
+        points = round(current_price - entry_price, 2)
+        if points <= -LAB_FIXED_SL_POINTS:
+            return f"{prefix} INITIAL SL HIT", f"OPTION POINTS {points} <= -{LAB_FIXED_SL_POINTS}"
+        if points >= LAB_BREAKEVEN_TRIGGER_POINTS and not trade.get("breakeven_active"):
+            trade["breakeven_active"] = True
+            trade["breakeven_price"] = entry_price
+            save_active_trades()
+        if trade.get("breakeven_active") and current_price <= float(trade.get("breakeven_price", entry_price)):
+            return f"{prefix} BREAKEVEN EXIT", f"After +{LAB_BREAKEVEN_TRIGGER_POINTS}, option returned to entry {entry_price}"
+        if points >= LAB_EMA_TRAIL_TRIGGER_POINTS and not trade.get("ema9_trail_active"):
+            trade["ema9_trail_active"] = True
+            save_active_trades()
+        if trade.get("ema9_trail_active"):
+            state = get_ema_trail_state_tf(tf, LAB_EMA_TRAIL_PERIOD)
+            if state is None:
+                return None, None
+            price = float(nifty)
+            ema9 = float(state["ema"])
+            if trade["trade_type"] == "BUY CE" and price < ema9:
+                return f"{prefix} CE EMA9 TRAIL EXIT", f"NIFTY {round(price, 2)} closed below TF{tf} EMA9 {ema9}"
+            if trade["trade_type"] == "BUY PE" and price > ema9:
+                return f"{prefix} PE EMA9 TRAIL EXIT", f"NIFTY {round(price, 2)} closed above TF{tf} EMA9 {ema9}"
+    except Exception as e:
+        print("Hybrid TF exit error:", e)
+        log_error(str(e))
+    return None, None
+
+
+# -------------------------- BOLLINGER TF --------------------------
+def calculate_bollinger_state_tf(tf):
+    candles = get_tf_working_candles(tf)
+    if not BOLLINGER_ENABLED or len(candles) < BOLLINGER_MIN_CANDLES:
+        return None
+    closes = [float(c["close"]) for c in candles]
+    window = closes[-BOLLINGER_PERIOD:]
+    if len(window) < BOLLINGER_PERIOD:
+        return None
+    mean = sum(window) / len(window)
+    variance = sum((x - mean) ** 2 for x in window) / len(window)
+    std = variance ** 0.5
+    return {"middle": round(mean, 2), "upper": round(mean + BOLLINGER_STD_MULTIPLIER * std, 2), "lower": round(mean - BOLLINGER_STD_MULTIPLIER * std, 2), "close": closes[-1], "prev_close": closes[-2] if len(closes) >= 2 else closes[-1], "minute": candles[-1].get("minute", "")}
+
+
+def get_bollinger_signal_tf(tf):
+    strategy_name = tf_name(BOLLINGER_NAME, tf)
+    state = calculate_bollinger_state_tf(tf)
+    completed = get_tf_completed_candles(tf)
+    working = get_tf_working_candles(tf)
+    if state is None or len(completed) < 1 or not working:
+        return None, None, None
+    prev = completed[-1]
+    current = working[-1]
+    price = float(current["close"])
+    if float(prev["low"]) < state["lower"] and price > state["lower"]:
+        key = f"CE_{state['minute']}_{state['lower']}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY CE", f"BOLLINGER_MEAN_TF{tf} BUY CE: pierced lower {state['lower']} and closed back inside", {"bb_stop": round(float(prev["low"]) - 2, 2)}
+    if float(prev["high"]) > state["upper"] and price < state["upper"]:
+        key = f"PE_{state['minute']}_{state['upper']}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY PE", f"BOLLINGER_MEAN_TF{tf} BUY PE: pierced upper {state['upper']} and closed back inside", {"bb_stop": round(float(prev["high"]) + 2, 2)}
+    return None, None, None
+
+
+def check_bollinger_exit_tf(trade, nifty, tf):
+    state = calculate_bollinger_state_tf(tf)
+    if state is None:
+        return None, None
+    price = float(nifty)
+    stop = float(trade.get("bb_stop", 0) or 0)
+    if trade["trade_type"] == "BUY CE":
+        if stop and price <= stop:
+            return f"BOLLINGER_TF{tf} STRUCTURE STOP", f"NIFTY {round(price, 2)} <= stop {stop}"
+        if price >= state["middle"]:
+            return f"BOLLINGER_TF{tf} MEAN TARGET", f"NIFTY {round(price, 2)} reached middle band {state['middle']}"
+    elif trade["trade_type"] == "BUY PE":
+        if stop and price >= stop:
+            return f"BOLLINGER_TF{tf} STRUCTURE STOP", f"NIFTY {round(price, 2)} >= stop {stop}"
+        if price <= state["middle"]:
+            return f"BOLLINGER_TF{tf} MEAN TARGET", f"NIFTY {round(price, 2)} reached middle band {state['middle']}"
+    return None, None
+
+
+# -------------------------- MACD TF --------------------------
+def get_macd_squeeze_signal_tf(tf):
+    strategy_name = tf_name(MACD_SQUEEZE_NAME, tf)
+    if not MACD_SQUEEZE_ENABLED:
+        return None, None
+    candles = get_tf_working_candles(tf)
+    if len(candles) < MACD_MIN_CANDLES:
+        return None, None
+    closes = [float(c["close"]) for c in candles]
+    hist = calculate_macd_histogram(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    if len(hist) < 4:
+        return None, None
+    h1, h2, h3 = hist[-3], hist[-2], hist[-1]
+    minute_key = candles[-1].get("minute", "")
+    if h2 < 0 and h1 > h2 and h3 > h2:
+        key = f"CE_{minute_key}_{h3}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY CE", f"MACD_SQUEEZE_TF{tf} BUY CE: Histogram improved from {h2} to {h3}"
+    if h2 > 0 and h1 < h2 and h3 < h2:
+        key = f"PE_{minute_key}_{h3}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY PE", f"MACD_SQUEEZE_TF{tf} BUY PE: Histogram faded from {h2} to {h3}"
+    return None, None
+
+
+def check_macd_squeeze_exit_tf(trade, tf):
+    candles = get_tf_working_candles(tf)
+    if len(candles) < MACD_MIN_CANDLES:
+        return None, None
+    closes = [float(c["close"]) for c in candles]
+    hist = calculate_macd_histogram(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    if len(hist) < 3:
+        return None, None
+    prev_h, curr_h = hist[-2], hist[-1]
+    if trade["trade_type"] == "BUY CE":
+        if curr_h > 0 and curr_h < prev_h:
+            return f"MACD_TF{tf} POSITIVE FADE EXIT", f"Histogram faded from {prev_h} to {curr_h}"
+        if curr_h < 0 and curr_h < prev_h:
+            return f"MACD_TF{tf} MOMENTUM FAILED EXIT", f"Histogram weakened from {prev_h} to {curr_h}"
+    elif trade["trade_type"] == "BUY PE":
+        if curr_h < 0 and curr_h > prev_h:
+            return f"MACD_TF{tf} NEGATIVE FADE EXIT", f"Histogram faded from {prev_h} to {curr_h}"
+        if curr_h > 0 and curr_h > prev_h:
+            return f"MACD_TF{tf} MOMENTUM FAILED EXIT", f"Histogram strengthened against PE from {prev_h} to {curr_h}"
+    return None, None
+
+
+# -------------------------- VWAP FALSE BREAK TF --------------------------
+def get_vwap_false_break_signal_tf(nifty, tf):
+    strategy_name = tf_name(VWAP_FALSE_BREAK_NAME, tf)
+    completed = get_tf_completed_candles(tf)
+    working = get_tf_working_candles(tf)
+    if not VWAP_FALSE_BREAK_ENABLED or current_vwap is None or len(completed) < VWAP_FALSE_BREAK_MIN_CANDLES or not working:
+        return None, None, None
+    prev = completed[-1]
+    current = working[-1]
+    price = float(nifty)
+    candle_open = float(current.get("open", price))
+    body = abs(price - candle_open)
+    if body < VWAP_FALSE_BREAK_MIN_BODY_POINTS:
+        return None, None, None
+    minute_key = current.get("minute", "")
+    session_high, session_low = get_session_high_low()
+    if float(prev["close"]) < float(prev.get("vwap", current_vwap) or current_vwap) and price > float(current_vwap):
+        key = f"CE_{minute_key}_{round(current_vwap, 2)}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY CE", f"VWAP_FALSE_BREAK_TF{tf} BUY CE: previous TF close below VWAP then reclaimed {current_vwap}", {"vwap_target": session_high or 0, "vwap_stop": float(prev["low"])}
+    if float(prev["close"]) > float(prev.get("vwap", current_vwap) or current_vwap) and price < float(current_vwap):
+        key = f"PE_{minute_key}_{round(current_vwap, 2)}"
+        if get_tf_signal_key(strategy_name, key):
+            return None, None, None
+        set_tf_signal_key(strategy_name, key)
+        return "BUY PE", f"VWAP_FALSE_BREAK_TF{tf} BUY PE: previous TF close above VWAP then rejected {current_vwap}", {"vwap_target": session_low or 0, "vwap_stop": float(prev["high"])}
+    return None, None, None
+
+
+# -------------------------- TF EXIT ROUTER --------------------------
+def check_timeframe_strategy_exit(strategy_name, trade, current_price, nifty):
+    tf = extract_tf(strategy_name)
+    if tf is None:
+        return None, None
+    if strategy_name.startswith("ADX_TF"):
+        return check_adx_exit_tf(trade, current_price, nifty, tf)
+    if strategy_name.startswith("RSI_STOCH_EMA_A_TF"):
+        return check_rsi_stoch_ema_exit_tf(trade, nifty, tf)
+    if strategy_name.startswith("RSI_STOCH_EMA_B_TF"):
+        return check_fixed_sl_target_exit(trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=LAB_FIXED_TARGET_POINTS, prefix=strategy_name)
+    if strategy_name.startswith("SUPER_EMA_A_TF"):
+        return check_super_ema_exit_tf(trade, current_price, nifty, tf)
+    if strategy_name.startswith("SUPER_EMA_B_TF"):
+        return check_fixed_sl_target_exit(trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=LAB_FIXED_TARGET_POINTS, prefix=strategy_name)
+    if strategy_name.startswith("SUPER_EMA_C_TF"):
+        return check_hybrid_exit_tf(trade, current_price, nifty, tf, prefix=strategy_name)
+    if strategy_name.startswith("MARKET_STRUCTURE_TF"):
+        points = round(float(current_price) - float(trade["entry_price"]), 2)
+        if points <= -STOPLOSS_POINTS:
+            return f"MARKET_STRUCTURE_TF{tf} STOPLOSS HIT", f"OPTION POINTS {points}"
+        if points >= TARGET_POINTS:
+            return f"MARKET_STRUCTURE_TF{tf} TARGET HIT", f"OPTION POINTS {points}"
+    if strategy_name.startswith("SL_HUNT_TF"):
+        return check_sl_hunt_exit_tf(trade, current_price, nifty, tf)
+    if strategy_name.startswith("EMA9_20_A_TF"):
+        return check_ema9_20_exit_tf(trade, tf)
+    if strategy_name.startswith("EMA9_20_C_TF"):
+        return check_ema9_trail_exit_tf(trade, current_price, nifty, tf, prefix=strategy_name)
+    if strategy_name.startswith("EMA9_20_D_TF"):
+        return check_hybrid_exit_tf(trade, current_price, nifty, tf, prefix=strategy_name)
+    if strategy_name.startswith("BOLLINGER_MEAN_TF"):
+        return check_bollinger_exit_tf(trade, nifty, tf)
+    if strategy_name.startswith("MACD_SQUEEZE_TF"):
+        return check_macd_squeeze_exit_tf(trade, tf)
+    if strategy_name.startswith("VWAP_FALSE_BREAK_TF"):
+        return check_vwap_false_break_exit(trade, nifty)
+    return None, None
+
+
+# -------------------------- TF ENTRY ENGINE --------------------------
+def run_timeframe_strategy_entries(entry_allowed, exited_strategies, now, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, call_price, put_price, atm_ce_symbol, atm_ce_token, atm_pe_symbol, atm_pe_token):
+    """Runs only multi-timeframe paper-trade strategy variants. PCR/SMC/ORB/GAMMA are intentionally not included."""
+    global TF_LAST_ENTRY_TIME
+    if not entry_allowed:
+        return
+
+    # ADX TF
+    for tf in TF_LIST:
+        strategy_name = tf_name("ADX", tf)
+        if strategy_name not in open_trades and strategy_name not in exited_strategies and tf_entry_cooldown_ok(strategy_name, now, ADX_FALL_EXIT_CANDLES * 60):
+            signal, trigger = get_adx_signal_tf(nifty, tf)
+            if signal == "BUY CE" and call_price is not None:
+                trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                enter_trade(strategy_name, trade); set_tf_entry_time(strategy_name, now)
+            elif signal == "BUY PE" and put_price is not None:
+                trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                enter_trade(strategy_name, trade); set_tf_entry_time(strategy_name, now)
+
+    # RSI_STOCH_EMA A/B TF
+    for tf in TF_LIST:
+        signal, trigger = get_rsi_stoch_ema_signal_tf(nifty, now, tf)
+        if signal:
+            for base in [RSI_STOCH_EMA_NAME, RSI_STOCH_EMA_B_NAME]:
+                strategy_name = tf_name(base, tf)
+                if strategy_name in open_trades or strategy_name in exited_strategies:
+                    continue
+                if signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger.replace("RSI_STOCH_EMA", strategy_name))
+                    enter_trade(strategy_name, trade)
+                elif signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger.replace("RSI_STOCH_EMA", strategy_name))
+                    enter_trade(strategy_name, trade)
+
+    # MARKET_STRUCTURE TF
+    for tf in TF_LIST:
+        strategy_name = tf_name(MARKET_STRUCTURE_NAME, tf)
+        if strategy_name not in open_trades and strategy_name not in exited_strategies and tf_entry_cooldown_ok(strategy_name, now, MS_COOLDOWN_SECONDS):
+            signal, trigger = get_market_structure_signal_tf(nifty, tf)
+            if signal == "BUY CE" and call_price is not None:
+                trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                enter_trade(strategy_name, trade); set_tf_entry_time(strategy_name, now)
+            elif signal == "BUY PE" and put_price is not None:
+                trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                enter_trade(strategy_name, trade); set_tf_entry_time(strategy_name, now)
+
+    # SUPER_EMA A/B/C TF
+    for tf in TF_LIST:
+        if not tf_entry_cooldown_ok(f"SUPER_EMA_GROUP_TF{tf}", now, SUPER_EMA_COOLDOWN_SECONDS):
+            continue
+        signal, trigger = get_super_ema_signal_tf(nifty, tf)
+        if signal:
+            entered_any = False
+            for base in [SUPER_EMA_NAME, SUPER_EMA_B_NAME, SUPER_EMA_C_NAME]:
+                strategy_name = tf_name(base, tf)
+                if strategy_name in open_trades or strategy_name in exited_strategies:
+                    continue
+                if signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger.replace("SUPER_EMA", strategy_name))
+                    enter_trade(strategy_name, trade); entered_any = True
+                elif signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger.replace("SUPER_EMA", strategy_name))
+                    enter_trade(strategy_name, trade); entered_any = True
+            if entered_any:
+                set_tf_entry_time(f"SUPER_EMA_GROUP_TF{tf}", now)
+
+    # SL_HUNT TF
+    for tf in TF_LIST:
+        strategy_name = tf_name(SL_HUNT_NAME, tf)
+        if strategy_name not in open_trades and strategy_name not in exited_strategies and tf_entry_cooldown_ok(strategy_name, now, SL_HUNT_COOLDOWN_SECONDS):
+            signal, trigger = get_sl_hunt_signal_tf(nifty, pcr_change_3min, atm_pcr_change_3min, tf)
+            if signal == "BUY CE" and call_price is not None:
+                trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                enter_trade(strategy_name, trade); set_tf_entry_time(strategy_name, now)
+            elif signal == "BUY PE" and put_price is not None:
+                trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                enter_trade(strategy_name, trade); set_tf_entry_time(strategy_name, now)
+
+    # EMA9_20 A/C/D TF
+    for tf in TF_LIST:
+        if not tf_entry_cooldown_ok(f"EMA9_20_GROUP_TF{tf}", now, EMA9_20_COOLDOWN_SECONDS):
+            continue
+        signal, trigger = get_ema9_20_signal_tf(tf)
+        if signal:
+            entered_any = False
+            for base in [EMA9_20_NAME, EMA9_20_C_NAME, EMA9_20_D_NAME]:
+                strategy_name = tf_name(base, tf)
+                if strategy_name in open_trades or strategy_name in exited_strategies:
+                    continue
+                if signal == "BUY CE" and call_price is not None:
+                    trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger.replace("EMA9_20", strategy_name))
+                    enter_trade(strategy_name, trade); entered_any = True
+                elif signal == "BUY PE" and put_price is not None:
+                    trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger.replace("EMA9_20", strategy_name))
+                    enter_trade(strategy_name, trade); entered_any = True
+            if entered_any:
+                set_tf_entry_time(f"EMA9_20_GROUP_TF{tf}", now)
+
+    # BOLLINGER TF
+    for tf in TF_LIST:
+        strategy_name = tf_name(BOLLINGER_NAME, tf)
+        if strategy_name not in open_trades and strategy_name not in exited_strategies:
+            signal, trigger, meta = get_bollinger_signal_tf(tf)
+            if signal == "BUY CE" and call_price is not None:
+                trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                if meta: trade.update(meta)
+                enter_trade(strategy_name, trade)
+            elif signal == "BUY PE" and put_price is not None:
+                trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                if meta: trade.update(meta)
+                enter_trade(strategy_name, trade)
+
+    # MACD TF
+    for tf in TF_LIST:
+        strategy_name = tf_name(MACD_SQUEEZE_NAME, tf)
+        if strategy_name not in open_trades and strategy_name not in exited_strategies:
+            signal, trigger = get_macd_squeeze_signal_tf(tf)
+            if signal == "BUY CE" and call_price is not None:
+                trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                enter_trade(strategy_name, trade)
+            elif signal == "BUY PE" and put_price is not None:
+                trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                enter_trade(strategy_name, trade)
+
+    # VWAP_FALSE_BREAK TF
+    for tf in TF_LIST:
+        strategy_name = tf_name(VWAP_FALSE_BREAK_NAME, tf)
+        if strategy_name not in open_trades and strategy_name not in exited_strategies and tf_entry_cooldown_ok(strategy_name, now, VWAP_FALSE_BREAK_COOLDOWN_SECONDS):
+            signal, trigger, meta = get_vwap_false_break_signal_tf(nifty, tf)
+            if signal == "BUY CE" and call_price is not None:
+                trade = create_trade(strategy_name, "BUY CE", atm_ce_symbol, atm_ce_token, call_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                if meta: trade.update(meta)
+                enter_trade(strategy_name, trade); set_tf_entry_time(strategy_name, now)
+            elif signal == "BUY PE" and put_price is not None:
+                trade = create_trade(strategy_name, "BUY PE", atm_pe_symbol, atm_pe_token, put_price, time_str, nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min, trigger)
+                if meta: trade.update(meta)
+                enter_trade(strategy_name, trade); set_tf_entry_time(strategy_name, now)
+
 # ==========================================================
 # EXIT LOGIC FOR ALL STRATEGIES
 # ==========================================================
@@ -3693,6 +4541,10 @@ def check_exit_for_trade(strategy_name, trade, call_price, put_price, time_str, 
         exit_reason, exit_trigger = check_fixed_sl_target_exit(
             trade, current_price, sl_points=LAB_FIXED_SL_POINTS, target_points=LAB_FIXED_TARGET_POINTS, prefix="PCR"
         )
+
+    # Multi-timeframe strategy lab exits. Does not affect PCR_ML_DATA recorder.
+    elif is_tf_strategy(strategy_name):
+        exit_reason, exit_trigger = check_timeframe_strategy_exit(strategy_name, trade, current_price, nifty)
 
     # Gamma Blast has expiry-specific OTM trailing and OI reversal exit.
     elif strategy_name == GAMMA_BLAST_NAME:
@@ -3814,7 +4666,7 @@ def create_trade(strategy_name, trade_type, symbol, token, price, time_str, nift
         "entry_trigger": entry_trigger
     }
 
-    if strategy_name == SUPER_EMA_NAME:
+    if strategy_name == SUPER_EMA_NAME or str(strategy_name).startswith("SUPER_EMA_A_TF"):
         trade["highest_price"] = round(price, 2)
         trade["trailing_sl_price"] = round(price * (1 - SUPER_EMA_OPTION_SL_PERCENT / 100), 2)
         trade["trailing_profit_percent"] = 0
@@ -3824,7 +4676,7 @@ def create_trade(strategy_name, trade_type, symbol, token, price, time_str, nift
         trade["highest_price"] = round(price, 2)
         trade["trailing_sl_price"] = round(price * (1 - GAMMA_OPTION_HARD_SL_PERCENT / 100), 2)
 
-    if strategy_name == SL_HUNT_NAME:
+    if strategy_name == SL_HUNT_NAME or str(strategy_name).startswith("SL_HUNT_TF"):
         trade["highest_price"] = round(price, 2)
         trade["trailing_sl_price"] = round(price * (1 - SL_HUNT_OPTION_SL_PERCENT / 100), 2)
 
@@ -4383,6 +5235,15 @@ while True:
                         trade.update(vwap_fb_meta)
                     enter_trade(VWAP_FALSE_BREAK_NAME, trade)
                     last_vwap_false_break_entry_time = now
+
+            # 15) Multi-timeframe strategy lab entry engine
+            # PCR, SMC, ORB and GAMMA are intentionally not included here.
+            # PCR_ML_DATA / option-chain recorder remains unchanged.
+            run_timeframe_strategy_entries(
+                entry_allowed, exited_strategies, now, time_str,
+                nifty, pcr, atm_pcr, max_pain, pcr_change_3min, atm_pcr_change_3min,
+                call_price, put_price, atm_ce_symbol, atm_ce_token, atm_pe_symbol, atm_pe_token
+            )
 
             # Update Gamma comparison snapshot after all entry logic.
             update_gamma_snapshot(context, nifty, otm_call_price, otm_put_price)
